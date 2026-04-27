@@ -216,11 +216,35 @@ async function applyServerSideCanvasEnhancement(
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url)
+
+    // Health check endpoint — lightweight, no tile generation
+    const healthCheck = searchParams.get('health')
+    if (healthCheck) {
+      let sdkStatus = 'unavailable'
+      try {
+        const zai = await ZAI.create()
+        if (zai) sdkStatus = 'available'
+      } catch {
+        sdkStatus = 'unavailable'
+      }
+      return NextResponse.json({
+        status: 'ok',
+        zai: sdkStatus,
+        timestamp: Date.now()
+      }, {
+        headers: {
+          'X-ZAI-Status': sdkStatus,
+          'Cache-Control': 'no-cache'
+        }
+      })
+    }
+
     const z = searchParams.get('z')
     const x = searchParams.get('x')
     const y = searchParams.get('y')
     const quality = searchParams.get('quality') || 'high'
     const mode = searchParams.get('mode') || 'enhanced-satellite'
+    const tileUrl = searchParams.get('url')
 
     if (!z || !x || !y) {
       return NextResponse.json({ error: 'z, x, y parameters required' }, { status: 400 })
@@ -257,11 +281,37 @@ export async function GET(request: NextRequest) {
       })
     }
 
-    return NextResponse.json({
-      message: 'AI-enhanced tile not cached. Use POST to generate.',
-      cacheKey,
-      quality,
-      mode
+    // NO CACHE: Proxy the original ESRI tile so Leaflet <img> gets actual image data
+    if (tileUrl) {
+      try {
+        const originalTile = await fetchOriginalTile(tileUrl)
+        return new NextResponse(originalTile.data, {
+          headers: {
+            'Content-Type': originalTile.contentType,
+            'Cache-Control': 'public, max-age=3600',
+            'X-Cache': 'MISS',
+            'X-Enhanced': 'original',
+            'X-Fallback': 'true'
+          }
+        })
+      } catch (proxyError) {
+        console.warn('[AIEnhanceTile] GET proxy fallback failed:', proxyError)
+      }
+    }
+
+    // Last resort: tiny transparent PNG (1x1 pixel)
+    const transparentPng = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+      'base64'
+    )
+    return new NextResponse(transparentPng, {
+      headers: {
+        'Content-Type': 'image/png',
+        'Cache-Control': 'no-cache',
+        'X-Cache': 'MISS',
+        'X-Enhanced': 'none',
+        'X-Fallback': 'true'
+      }
     })
 
   } catch (error) {
@@ -368,8 +418,9 @@ export async function POST(request: NextRequest) {
           }
         ]
 
-        const analysisResult = await zai.chat.completions.create({
-          messages: vlmMessages as Parameters<typeof zai.chat.completions.create>[0]['messages']
+        const analysisResult = await zai.chat.completions.createVision({
+          model: 'glm-4v-flash',
+          messages: vlmMessages as unknown as Parameters<typeof zai.chat.completions.createVision>[0]['messages']
         })
 
         vlmDescription = analysisResult.choices?.[0]?.message?.content || ''

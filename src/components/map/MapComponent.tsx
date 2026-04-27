@@ -1,20 +1,22 @@
 'use client'
 
 /**
- * MapComponent (2D) - v7.3 with ZAI AI Enhancement
+ * MapComponent (2D) - v8.1 with ZAI AI Enhancement
  *
- * v7.3 fixes:
- * - Proper ZAI connectivity check on mount (tests /api/generate-tile)
- * - Real-time tracking of AI enhancement results (not blind fire-and-forget)
- * - Clear error states: shows if ZAI is unavailable vs processing vs working
- * - Removed broken polling (was checking z=0,x=0,y=0 = always miss)
- * - Console logging for every step so you can debug in browser DevTools
+ * v8.1 fixes:
+ * - Lightweight health check (GET /api/enhance-tile?health=1) instead of heavy POST
+ * - mountIdRef guard prevents L.map() race condition on React 18 double-mount
+ * - AITileLayer uses L.TileLayer.extend() cast for TypeScript compat
+ * - quality=high added to buildTileUrl for consistent AI generation
+ * - generate-tile proxy endpoint added (was empty)
+ * - enhance-tile GET now proxies original tile instead of returning JSON
+ * - VLM call uses createVision() instead of create()
  *
  * Tile flow:
  *   Low zoom (< 14):  Direct ESRI tiles (fast, no proxy)
- *   High zoom (>= 14): /api/enhance-tile?url=...&mode=ai
+ *   High zoom (>= 14): /api/enhance-tile?url=...&quality=high&mode=ai
  *     → checks AI cache → returns enhanced tile if available
- *     → otherwise returns proxy tile + triggers AI generation
+ *     → otherwise proxies original tile + triggers AI generation
  *     → next load gets the AI-enhanced version from cache
  */
 
@@ -64,56 +66,38 @@ function buildTileUrl(z: number, x: number, y: number): string {
     .replace('{x}', String(x))
     .replace('{y}', String(y))
 
-  return `/api/enhance-tile?url=${encodeURIComponent(originalUrl)}&z=${z}&x=${x}&y=${y}&mode=ai`
+  return `/api/enhance-tile?url=${encodeURIComponent(originalUrl)}&z=${z}&x=${x}&y=${y}&quality=high&mode=ai`
 }
 
-/** Check if ZAI is actually available by sending a test tile request */
 async function checkZAIStatus(): Promise<'ready' | 'no-sdk' | 'error'> {
   try {
-    // Use POST with a test tile — this is what the actual pipeline does.
-    // GET with fake coords returns 405 or cache-miss JSON, not useful.
-    const testOriginalUrl = ESRI_TILE_TEMPLATE
-      .replace('{z}', '14')
-      .replace('{x}', '12345')
-      .replace('{y}', '67890')
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 5000)
 
-    const response = await fetch('/api/generate-tile', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        z: 14,
-        x: 12345,
-        y: 67890,
-        originalUrl: testOriginalUrl,
-        quality: 'high',
-        mode: 'enhanced-satellite',
-        region: 'Kampala, Uganda'
-      })
+    const response = await fetch('/api/enhance-tile?health=1', {
+      method: 'GET',
+      signal: controller.signal
     })
+    clearTimeout(timeoutId)
 
     if (response.ok) {
-      const enhanced = response.headers.get('X-Enhanced') || ''
-      // If we get any 200 response (ai, original, or proxy), ZAI endpoint works
-      console.log(`[MapComponent v7.3] ZAI check: X-Enhanced=${enhanced}, status=${response.status}`)
-      return 'ready'
-    }
-
-    // 503 = SDK not available
-    if (response.status === 503) {
-      const data = await response.json().catch(() => ({}))
-      if (data.fallback || data.error?.includes('not available') || data.error?.includes('not installed')) {
-        console.warn('[MapComponent v7.3] ZAI SDK not installed on server')
-        return 'no-sdk'
+      const zaiHeader = response.headers.get('X-ZAI-Status') || ''
+      console.log(`[MapComponent v8.1] ZAI health check: X-ZAI-Status=${zaiHeader}`)
+      if (zaiHeader === 'available') {
+        return 'ready'
       }
-      return 'error'
+      console.warn('[MapComponent v8.1] ZAI SDK not available on server')
+      return 'no-sdk'
     }
 
-    // Other errors (400, 404, 405, 500)
-    const errorText = await response.text().catch(() => '')
-    console.warn(`[MapComponent v7.3] ZAI check failed: ${response.status} ${errorText}`)
+    console.warn(`[MapComponent v8.1] ZAI health check failed: ${response.status}`)
     return 'error'
   } catch (err) {
-    console.warn('[MapComponent v7.3] ZAI check network error:', err)
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      console.warn('[MapComponent v8.1] ZAI health check timed out (5s)')
+    } else {
+      console.warn('[MapComponent v8.1] ZAI health check network error:', err)
+    }
     return 'error'
   }
 }
@@ -133,6 +117,7 @@ export default function MapComponent({
 }: MapComponentProps) {
   const mapRef = useRef<LeafletMap | null>(null)
   const mapContainerRef = useRef<HTMLDivElement>(null)
+  const mountIdRef = useRef(0)
   const [isMapReady, setIsMapReady] = useState(false)
   const [enhancementStatus, setEnhancementStatus] = useState<EnhancementStatus>('off')
   const [aiTileCount, setAiTileCount] = useState(0)
@@ -178,6 +163,8 @@ export default function MapComponent({
     const container = mapContainerRef.current
     if (!container) return
 
+    const thisMountId = ++mountIdRef.current
+
     // React 18 Strict Mode double-mount guard:
     // If the container already has a Leaflet map (from the first mount),
     // remove it before creating a new one.
@@ -191,10 +178,14 @@ export default function MapComponent({
     if (leafletId !== undefined) {
       delete (container as unknown as Record<string, unknown>)._leaflet_id
     }
+    const leafletProp = (container as unknown as Record<string, unknown>)._leaflet
+    if (leafletProp !== undefined) {
+      delete (container as unknown as Record<string, unknown>)._leaflet
+    }
 
     import('leaflet').then(async (L) => {
       // Double-check: if another mount beat us, bail out
-      if (mapRef.current) return
+      if (mountIdRef.current !== thisMountId) return
 
       // Inject Leaflet CSS
       const linkEl = document.createElement('link')
@@ -210,21 +201,28 @@ export default function MapComponent({
       // CHECK ZAI AVAILABILITY FIRST
       // ============================================
       setEnhancementStatus('checking')
-      console.log('[MapComponent v7.3] Checking ZAI availability...')
+      console.log('[MapComponent v8.1] Checking ZAI availability...')
 
       const zaiStatus = await checkZAIStatus()
 
+      // Guard: if component unmounted/remounted during async check, bail
+      if (mountIdRef.current !== thisMountId) return
+
       if (zaiStatus === 'no-sdk') {
-        console.warn('[MapComponent v7.3] ZAI SDK not installed — using CSS-enhanced satellite only')
+        console.warn('[MapComponent v8.1] ZAI SDK not installed — using CSS-enhanced satellite only')
         setEnhancementStatus('unavailable')
         setZaiError('ZAI SDK not installed. Run: npm install z-ai-web-dev-sdk')
       } else if (zaiStatus === 'error') {
-        console.warn('[MapComponent v7.3] ZAI endpoint error — using CSS-enhanced satellite only')
+        console.warn('[MapComponent v8.1] ZAI endpoint error — using CSS-enhanced satellite only')
         setEnhancementStatus('unavailable')
         setZaiError('ZAI endpoint unreachable')
       } else {
-        console.log('[MapComponent v7.3] ZAI is available — tiles will be AI-enhanced')
+        console.log('[MapComponent v8.1] ZAI is available — tiles will be AI-enhanced')
       }
+
+      // Clean up leftover _leaflet_id and _leaflet on container before L.map()
+      delete (container as unknown as Record<string, unknown>)._leaflet_id
+      delete (container as unknown as Record<string, unknown>)._leaflet
 
       // Create map
       const map = L.map(container, {
@@ -243,7 +241,7 @@ export default function MapComponent({
         getTileUrl: function(coords: { x: number; y: number; z: number }): string {
           return buildTileUrl(coords.z, coords.x, coords.y)
         }
-      })
+      }) as unknown as new (url: string, options: L.TileLayerOptions) => L.TileLayer
 
       const aiTileLayer = new AITileLayer('', {
         maxZoom: 19,
@@ -274,7 +272,7 @@ export default function MapComponent({
           setEnhancementStatus('proxy')
         }
 
-        console.log(`[MapComponent v7.3] Triggering AI enhancement for tile ${tileKey}`)
+        console.log(`[MapComponent v8.1] Triggering AI enhancement for tile ${tileKey}`)
 
         // Trigger AI generation and TRACK the result
         const originalUrl = ESRI_TILE_TEMPLATE
@@ -352,10 +350,11 @@ export default function MapComponent({
       mapRef.current = map
       setIsMapReady(true)
 
-      console.log('[MapComponent v7.3] Map initialized. ZAI status:', zaiStatus)
+      console.log('[MapComponent v8.1] Map initialized. ZAI status:', zaiStatus)
     })
 
     return () => {
+      mountIdRef.current++
       if (mapRef.current) {
         mapRef.current.remove()
         mapRef.current = null

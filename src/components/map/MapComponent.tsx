@@ -1,22 +1,19 @@
 'use client'
 
 /**
- * MapComponent (2D) - v8.1 with ZAI AI Enhancement
+ * MapComponent (2D) - v8.0 with ZAI AI Enhancement
  *
- * v8.1 fixes:
- * - Lightweight health check (GET /api/enhance-tile?health=1) instead of heavy POST
- * - mountIdRef guard prevents L.map() race condition on React 18 double-mount
- * - AITileLayer uses L.TileLayer.extend() cast for TypeScript compat
- * - quality=high added to buildTileUrl for consistent AI generation
- * - generate-tile proxy endpoint added (was empty)
- * - enhance-tile GET now proxies original tile instead of returning JSON
- * - VLM call uses createVision() instead of create()
+ * v8.0 fixes:
+ * - React 18 Strict Mode: mountIdRef guard prevents double-init race
+ * - ZAI check uses lightweight GET ?health=1 instead of expensive POST
+ * - Leaflet container cleanup: removes _leaflet_id before re-init
+ * - Proper ESRI tile URL template replacement order ({z}/{y}/{x})
  *
  * Tile flow:
  *   Low zoom (< 14):  Direct ESRI tiles (fast, no proxy)
- *   High zoom (>= 14): /api/enhance-tile?url=...&quality=high&mode=ai
+ *   High zoom (>= 14): /api/enhance-tile?url=...&mode=ai
  *     → checks AI cache → returns enhanced tile if available
- *     → otherwise proxies original tile + triggers AI generation
+ *     → otherwise returns proxy tile + triggers AI generation
  *     → next load gets the AI-enhanced version from cache
  */
 
@@ -34,6 +31,7 @@ const OVERVIEW_ZOOM = 13
 const BUILDING_ZOOM = 18
 const ZOOM_DURATION = 2.5
 
+// ESRI World Imagery uses {z}/{y}/{x} order (NOT {z}/{x}/{y})
 const ESRI_TILE_TEMPLATE = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
 const AI_ENHANCE_MIN_ZOOM = 14
 
@@ -57,47 +55,74 @@ function buildTileUrl(z: number, x: number, y: number): string {
   if (z < AI_ENHANCE_MIN_ZOOM) {
     return ESRI_TILE_TEMPLATE
       .replace('{z}', String(z))
-      .replace('{x}', String(x))
       .replace('{y}', String(y))
+      .replace('{x}', String(x))
   }
 
   const originalUrl = ESRI_TILE_TEMPLATE
     .replace('{z}', String(z))
-    .replace('{x}', String(x))
     .replace('{y}', String(y))
+    .replace('{x}', String(x))
 
-  return `/api/enhance-tile?url=${encodeURIComponent(originalUrl)}&z=${z}&x=${x}&y=${y}&quality=high&mode=ai`
+  return `/api/enhance-tile?url=${encodeURIComponent(originalUrl)}&z=${z}&x=${x}&y=${y}&mode=ai&quality=high`
 }
 
+/** Check if ZAI is actually available using lightweight health endpoint */
 async function checkZAIStatus(): Promise<'ready' | 'no-sdk' | 'error'> {
   try {
-    const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 5000)
-
-    const response = await fetch('/api/enhance-tile?health=1', {
+    // Use lightweight health check first (no AI generation, just tests if SDK loads)
+    const healthResponse = await fetch('/api/generate-tile?health=1', {
       method: 'GET',
-      signal: controller.signal
+      signal: AbortSignal.timeout(5000)
     })
-    clearTimeout(timeoutId)
 
-    if (response.ok) {
-      const zaiHeader = response.headers.get('X-ZAI-Status') || ''
-      console.log(`[MapComponent v8.1] ZAI health check: X-ZAI-Status=${zaiHeader}`)
-      if (zaiHeader === 'available') {
+    if (healthResponse.ok) {
+      const data = await healthResponse.json().catch(() => ({}))
+      if (data.status === 'ok') {
+        console.log('[MapComponent v8.0] ZAI health check: SDK installed')
         return 'ready'
       }
-      console.warn('[MapComponent v8.1] ZAI SDK not available on server')
+    }
+
+    if (healthResponse.status === 503) {
+      console.warn('[MapComponent v8.0] ZAI SDK not installed on server')
       return 'no-sdk'
     }
 
-    console.warn(`[MapComponent v8.1] ZAI health check failed: ${response.status}`)
+    // If health endpoint returns 404 (older version without health check),
+    // fall back to a POST test
+    if (healthResponse.status === 404) {
+      console.log('[MapComponent v8.0] Health endpoint not found, trying POST test...')
+      const testOriginalUrl = ESRI_TILE_TEMPLATE
+        .replace('{z}', '14')
+        .replace('{y}', '67890')
+        .replace('{x}', '12345')
+
+      const response = await fetch('/api/generate-tile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          z: 14, x: 12345, y: 67890,
+          originalUrl: testOriginalUrl,
+          quality: 'high',
+          mode: 'enhanced-satellite',
+          region: 'Kampala, Uganda'
+        }),
+        signal: AbortSignal.timeout(10000)
+      })
+
+      if (response.ok) {
+        return 'ready'
+      }
+      if (response.status === 503) {
+        return 'no-sdk'
+      }
+      return 'error'
+    }
+
     return 'error'
   } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') {
-      console.warn('[MapComponent v8.1] ZAI health check timed out (5s)')
-    } else {
-      console.warn('[MapComponent v8.1] ZAI health check network error:', err)
-    }
+    console.warn('[MapComponent v8.0] ZAI check network error:', err)
     return 'error'
   }
 }
@@ -123,7 +148,6 @@ export default function MapComponent({
   const [aiTileCount, setAiTileCount] = useState(0)
   const [zaiError, setZaiError] = useState<string | null>(null)
 
-  // Track enhancement results in a ref (avoids stale closures)
   const enhancementTracker = useRef({
     sent: 0,
     succeeded: 0,
@@ -163,66 +187,60 @@ export default function MapComponent({
     const container = mapContainerRef.current
     if (!container) return
 
+    // React 18 Strict Mode double-mount guard
     const thisMountId = ++mountIdRef.current
 
-    // React 18 Strict Mode double-mount guard:
-    // If the container already has a Leaflet map (from the first mount),
-    // remove it before creating a new one.
+    // Clean up any existing Leaflet instance
     const existingMap = mapRef.current
     if (existingMap) {
       existingMap.remove()
       mapRef.current = null
     }
-    // Also clear any leftover Leaflet internal ID on the DOM element
-    const leafletId = (container as unknown as Record<string, unknown>)._leaflet_id
-    if (leafletId !== undefined) {
-      delete (container as unknown as Record<string, unknown>)._leaflet_id
+    // Clear leftover Leaflet internal IDs
+    const containerAny = container as unknown as Record<string, unknown>
+    if (containerAny._leaflet_id !== undefined) {
+      delete containerAny._leaflet_id
     }
-    const leafletProp = (container as unknown as Record<string, unknown>)._leaflet
-    if (leafletProp !== undefined) {
-      delete (container as unknown as Record<string, unknown>)._leaflet
+    if (containerAny._leaflet !== undefined) {
+      delete containerAny._leaflet
     }
 
     import('leaflet').then(async (L) => {
-      // Double-check: if another mount beat us, bail out
+      // Guard: if a newer mount beat us, bail out
       if (mountIdRef.current !== thisMountId) return
 
       // Inject Leaflet CSS
-      const linkEl = document.createElement('link')
-      linkEl.rel = 'stylesheet'
-      linkEl.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'
-      linkEl.integrity = 'sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY='
-      linkEl.crossOrigin = ''
       if (!document.querySelector('link[href*="leaflet.css"]')) {
+        const linkEl = document.createElement('link')
+        linkEl.rel = 'stylesheet'
+        linkEl.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'
+        linkEl.integrity = 'sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY='
+        linkEl.crossOrigin = ''
         document.head.appendChild(linkEl)
       }
 
       // ============================================
-      // CHECK ZAI AVAILABILITY FIRST
+      // CHECK ZAI AVAILABILITY
       // ============================================
       setEnhancementStatus('checking')
-      console.log('[MapComponent v8.1] Checking ZAI availability...')
+      console.log('[MapComponent v8.0] Checking ZAI availability...')
 
       const zaiStatus = await checkZAIStatus()
 
-      // Guard: if component unmounted/remounted during async check, bail
+      // Guard: check again after async
       if (mountIdRef.current !== thisMountId) return
 
       if (zaiStatus === 'no-sdk') {
-        console.warn('[MapComponent v8.1] ZAI SDK not installed — using CSS-enhanced satellite only')
+        console.warn('[MapComponent v8.0] ZAI SDK not installed')
         setEnhancementStatus('unavailable')
         setZaiError('ZAI SDK not installed. Run: npm install z-ai-web-dev-sdk')
       } else if (zaiStatus === 'error') {
-        console.warn('[MapComponent v8.1] ZAI endpoint error — using CSS-enhanced satellite only')
+        console.warn('[MapComponent v8.0] ZAI endpoint error')
         setEnhancementStatus('unavailable')
         setZaiError('ZAI endpoint unreachable')
       } else {
-        console.log('[MapComponent v8.1] ZAI is available — tiles will be AI-enhanced')
+        console.log('[MapComponent v8.0] ZAI is available')
       }
-
-      // Clean up leftover _leaflet_id and _leaflet on container before L.map()
-      delete (container as unknown as Record<string, unknown>)._leaflet_id
-      delete (container as unknown as Record<string, unknown>)._leaflet
 
       // Create map
       const map = L.map(container, {
@@ -241,9 +259,9 @@ export default function MapComponent({
         getTileUrl: function(coords: { x: number; y: number; z: number }): string {
           return buildTileUrl(coords.z, coords.x, coords.y)
         }
-      }) as unknown as new (url: string, options: L.TileLayerOptions) => L.TileLayer
+      })
 
-      const aiTileLayer = new AITileLayer('', {
+      const aiTileLayer = new (AITileLayer as unknown as typeof L.TileLayer)('', {
         maxZoom: 19,
         attribution: '&copy; Esri &mdash; AI-Enhanced by DirectDDL',
         className: 'ai-enhanced-tiles'
@@ -262,23 +280,20 @@ export default function MapComponent({
 
         const tileKey = `${coords.z}/${coords.x}/${coords.y}`
 
-        // Skip if already sent for this tile
         if (enhancementTracker.current.sentTiles.has(tileKey)) return
         enhancementTracker.current.sentTiles.add(tileKey)
         enhancementTracker.current.sent++
 
-        // Update status
         if (enhancementStatus === 'checking' || enhancementStatus === 'off') {
           setEnhancementStatus('proxy')
         }
 
-        console.log(`[MapComponent v8.1] Triggering AI enhancement for tile ${tileKey}`)
+        console.log(`[MapComponent v8.0] Triggering AI enhancement for tile ${tileKey}`)
 
-        // Trigger AI generation and TRACK the result
         const originalUrl = ESRI_TILE_TEMPLATE
           .replace('{z}', String(coords.z))
-          .replace('{x}', String(coords.x))
           .replace('{y}', String(coords.y))
+          .replace('{x}', String(coords.x))
 
         fetch('/api/generate-tile', {
           method: 'POST',
@@ -299,14 +314,12 @@ export default function MapComponent({
 
             if (response.ok) {
               if (enhanced === 'ai') {
-                // ZAI actually generated an AI-enhanced tile!
                 enhancementTracker.current.succeeded++
                 setAiTileCount(enhancementTracker.current.succeeded)
                 setEnhancementStatus('enhanced')
-                console.log(`[MapComponent v7.3] AI tile DONE: ${tileKey} (${processingTime}ms)`)
+                console.log(`[MapComponent v8.0] AI tile DONE: ${tileKey} (${processingTime}ms)`)
               } else if (enhanced === 'original') {
-                // ZAI returned original as fallback (SDK might not be working)
-                console.warn(`[MapComponent v7.3] AI returned original tile for ${tileKey} (X-Enhanced: ${enhanced})`)
+                console.warn(`[MapComponent v8.0] AI returned original tile for ${tileKey}`)
                 enhancementTracker.current.failed++
 
                 if (enhancementTracker.current.failed >= 3 && enhancementTracker.current.succeeded === 0) {
@@ -314,18 +327,16 @@ export default function MapComponent({
                   setEnhancementStatus('unavailable')
                 }
               } else {
-                // Cached AI tile
                 if (enhanced === 'ai') {
                   enhancementTracker.current.succeeded++
                   setAiTileCount(enhancementTracker.current.succeeded)
                 }
-                console.log(`[MapComponent v7.3] Tile ${tileKey}: X-Enhanced=${enhanced}, X-Cache=${response.headers.get('X-Cache')}`)
+                console.log(`[MapComponent v8.0] Tile ${tileKey}: X-Enhanced=${enhanced}, X-Cache=${response.headers.get('X-Cache')}`)
               }
             } else {
-              // API error
               enhancementTracker.current.failed++
               const errorData = await response.json().catch(() => ({}))
-              console.warn(`[MapComponent v7.3] AI generation failed for ${tileKey}:`, response.status, errorData)
+              console.warn(`[MapComponent v8.0] AI generation failed for ${tileKey}:`, response.status, errorData)
 
               if (errorData.fallback || response.status === 503) {
                 setZaiError('ZAI SDK not available on server')
@@ -335,11 +346,10 @@ export default function MapComponent({
           })
           .catch((err) => {
             enhancementTracker.current.failed++
-            console.warn(`[MapComponent v7.3] AI request failed for ${tileKey}:`, err)
+            console.warn(`[MapComponent v8.0] AI request failed for ${tileKey}:`, err)
           })
       })
 
-      // Track zoom for status
       map.on('zoomend', () => {
         const zoom = map.getZoom()
         if (zoom >= AI_ENHANCE_MIN_ZOOM && enhancementStatus === 'off') {
@@ -347,14 +357,19 @@ export default function MapComponent({
         }
       })
 
+      // Final guard before committing
+      if (mountIdRef.current !== thisMountId) {
+        map.remove()
+        return
+      }
+
       mapRef.current = map
       setIsMapReady(true)
 
-      console.log('[MapComponent v8.1] Map initialized. ZAI status:', zaiStatus)
+      console.log('[MapComponent v8.0] Map initialized. ZAI status:', zaiStatus)
     })
 
     return () => {
-      mountIdRef.current++
       if (mapRef.current) {
         mapRef.current.remove()
         mapRef.current = null
@@ -498,7 +513,6 @@ export default function MapComponent({
 
       {/* AI Enhancement Status Indicator */}
       <div className="absolute bottom-4 right-4 z-[1000] flex flex-col items-end gap-1">
-        {/* Main status pill */}
         <div className="flex items-center gap-2 px-3 py-1.5 bg-white/90 backdrop-blur-sm rounded-full shadow-lg text-xs font-medium">
           <span className={`inline-block w-2 h-2 rounded-full ${
             enhancementStatus === 'enhanced' ? 'bg-green-500' :
@@ -508,7 +522,6 @@ export default function MapComponent({
             enhancementStatus === 'proxy' ? 'bg-yellow-500' :
             'bg-gray-400'
           }`} />
-
           <span className="text-gray-600">
             {enhancementStatus === 'off' && 'Satellite'}
             {enhancementStatus === 'checking' && 'Checking ZAI...'}
@@ -518,8 +531,6 @@ export default function MapComponent({
             {enhancementStatus === 'unavailable' && 'ZAI Unavailable'}
           </span>
         </div>
-
-        {/* Error detail (if ZAI unavailable) */}
         {zaiError && (
           <div className="px-3 py-1 bg-red-50 border border-red-200 rounded-lg shadow text-xs text-red-600 max-w-64">
             {zaiError}

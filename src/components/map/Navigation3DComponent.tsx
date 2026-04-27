@@ -3,7 +3,8 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import maplibregl from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
-import { getTileEnhancer, type AIQualityLevel, type AIEnhancementMode } from '@/lib/ai-tile-enhancer'
+import { getTileEnhancer } from '@/lib/ai-tile-enhancer'
+import type { AIQualityLevel, AIEnhancementMode } from '@/types/map'
 import aiTileGenerationService, { type EnhancementStatus } from '@/services/aiTileGenerationService'
 import { getMapLibreStyle } from '@/components/map/TileLayerConfig'
 import { DEFAULT_SATELLITE_SOURCE, POI_MARKERS } from '@/lib/config'
@@ -94,12 +95,14 @@ export default function Navigation3DComponent({
 
   useEffect(() => {
     const enhancer = aiTileGenerationService.init({
-      enabled: useEnhancedTiles,
       quality: aiQuality,
       mode: aiMode,
       region: 'Kampala, Uganda',
       tileSourceUrl: DEFAULT_SATELLITE_SOURCE.url
     })
+    if (useEnhancedTiles) {
+      enhancer.setAIEnabled(true)
+    }
     aiEnhancerRef.current = enhancer
 
     const unsubscribe = aiTileGenerationService.onStatusChange((status) => {

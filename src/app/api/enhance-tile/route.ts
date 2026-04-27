@@ -20,18 +20,9 @@ import ZAI from 'z-ai-web-dev-sdk'
 // - ultra:    1344x768 (highest detail, wider aspect)
 // ============================================
 
-// Multimodal message content type (z-ai-web-dev-sdk types only define
-// content as string, but the runtime API accepts arrays for VLM)
-interface MultimodalContent {
-  type: 'text' | 'image_url'
-  text?: string
-  image_url?: { url: string }
-}
-
-interface MultimodalChatMessage {
-  role: 'system' | 'user' | 'assistant'
-  content: string | MultimodalContent[]
-}
+// Use the ZAI SDK's built-in VisionMessage and VisionMultimodalContentItem types
+// for proper VLM (Vision Language Model) calls.
+import type { VisionMessage, VisionMultimodalContentItem } from 'z-ai-web-dev-sdk'
 
 interface AITileCacheEntry {
   data: ArrayBuffer
@@ -217,26 +208,25 @@ export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url)
 
-    // Health check endpoint — lightweight, no tile generation
-    const healthCheck = searchParams.get('health')
-    if (healthCheck) {
-      let sdkStatus = 'unavailable'
+    // Lightweight health check — used by MapComponent to test if ZAI SDK is available
+    if (searchParams.get('health') === '1') {
       try {
         const zai = await ZAI.create()
-        if (zai) sdkStatus = 'available'
-      } catch {
-        sdkStatus = 'unavailable'
-      }
-      return NextResponse.json({
-        status: 'ok',
-        zai: sdkStatus,
-        timestamp: Date.now()
-      }, {
-        headers: {
-          'X-ZAI-Status': sdkStatus,
-          'Cache-Control': 'no-cache'
+        if (zai) {
+          return NextResponse.json({
+            status: 'ok',
+            sdk: 'z-ai-web-dev-sdk',
+            message: 'ZAI SDK is installed and initialized'
+          })
         }
-      })
+      } catch {
+        return NextResponse.json({
+          status: 'error',
+          sdk: 'z-ai-web-dev-sdk',
+          error: 'ZAI SDK failed to initialize',
+          fallback: true
+        }, { status: 503 })
+      }
     }
 
     const z = searchParams.get('z')
@@ -244,7 +234,6 @@ export async function GET(request: NextRequest) {
     const y = searchParams.get('y')
     const quality = searchParams.get('quality') || 'high'
     const mode = searchParams.get('mode') || 'enhanced-satellite'
-    const tileUrl = searchParams.get('url')
 
     if (!z || !x || !y) {
       return NextResponse.json({ error: 'z, x, y parameters required' }, { status: 400 })
@@ -281,37 +270,11 @@ export async function GET(request: NextRequest) {
       })
     }
 
-    // NO CACHE: Proxy the original ESRI tile so Leaflet <img> gets actual image data
-    if (tileUrl) {
-      try {
-        const originalTile = await fetchOriginalTile(tileUrl)
-        return new NextResponse(originalTile.data, {
-          headers: {
-            'Content-Type': originalTile.contentType,
-            'Cache-Control': 'public, max-age=3600',
-            'X-Cache': 'MISS',
-            'X-Enhanced': 'original',
-            'X-Fallback': 'true'
-          }
-        })
-      } catch (proxyError) {
-        console.warn('[AIEnhanceTile] GET proxy fallback failed:', proxyError)
-      }
-    }
-
-    // Last resort: tiny transparent PNG (1x1 pixel)
-    const transparentPng = Buffer.from(
-      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
-      'base64'
-    )
-    return new NextResponse(transparentPng, {
-      headers: {
-        'Content-Type': 'image/png',
-        'Cache-Control': 'no-cache',
-        'X-Cache': 'MISS',
-        'X-Enhanced': 'none',
-        'X-Fallback': 'true'
-      }
+    return NextResponse.json({
+      message: 'AI-enhanced tile not cached. Use POST to generate.',
+      cacheKey,
+      quality,
+      mode
     })
 
   } catch (error) {
@@ -401,10 +364,10 @@ export async function POST(request: NextRequest) {
         const originalBase64 = arrayBufferToBase64(originalTile.data)
         const originalDataUrl = `data:${originalTile.contentType};base64,${originalBase64}`
 
-        // Use MultimodalChatMessage to properly type VLM messages with image content.
-        // The SDK's ChatMessage type only allows string content, but the API
-        // accepts multimodal arrays at runtime.
-        const vlmMessages: MultimodalChatMessage[] = [
+        // Use createVision() — the CORRECT SDK method for multimodal VLM calls.
+        // create() only accepts ChatMessage[] (string content); createVision()
+        // accepts VisionMessage[] with image_url content. Model is REQUIRED.
+        const vlmMessages: VisionMessage[] = [
           {
             role: 'system',
             content: 'You are a satellite imagery analyst specializing in East African geography. Describe what you see in this satellite tile image in precise detail. Focus on: terrain type, building density, road patterns, vegetation cover, water features, and land use. Be concise but specific — your description will be used to generate an enhanced version.'
@@ -414,13 +377,13 @@ export async function POST(request: NextRequest) {
             content: [
               { type: 'text', text: `Analyze this satellite tile at zoom level ${z}, coordinates ${x}/${y}. Describe the geographic features visible:` },
               { type: 'image_url', image_url: { url: originalDataUrl } }
-            ]
+            ] as VisionMultimodalContentItem[]
           }
         ]
 
         const analysisResult = await zai.chat.completions.createVision({
           model: 'glm-4v-flash',
-          messages: vlmMessages as unknown as Parameters<typeof zai.chat.completions.createVision>[0]['messages']
+          messages: vlmMessages
         })
 
         vlmDescription = analysisResult.choices?.[0]?.message?.content || ''

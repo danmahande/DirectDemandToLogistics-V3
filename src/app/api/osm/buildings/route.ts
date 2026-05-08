@@ -1,595 +1,244 @@
+import { NextRequest, NextResponse } from 'next/server'
+
+// ═══════════════════════════════════════════════════════════
+// OSM BUILDINGS API (v6 — FIXED)
+// ═══════════════════════════════════════════════════════════
+// Fetches building data from OpenStreetMap Overpass API
+// for a given bounding box around Kampala.
+//
+// Usage: GET /api/osm/buildings?bbox=south,west,north,east
+//
+// Returns: GeoJSON FeatureCollection of buildings with height data
+// ═══════════════════════════════════════════════════════════
+
+const OVERPASS_API = 'https://overpass-api.de/api/interpreter'
+const CACHE_DURATION = 6 * 60 * 60 * 1000 // 6 hours (buildings don't change often)
+
+interface BuildingCacheEntry {
+  data: unknown
+  timestamp: number
+}
+
+const buildingCache = new Map<string, BuildingCacheEntry>()
+
 /**
- * Enhanced Tile Source Configuration (v7 — FIXED for Kampala)
- *
- * KEY FIXES over v6:
- * - Google satellite now routed through server-side proxy to bypass CORS/access restrictions
- * - OSM Buildings fetch timeout increased from 15s to 30s (matches Overpass API timeout)
- * - ESRI sources still available but NOT used as fallback — fail explicitly instead
- * - Satellite tile proxy ensures true-color imagery loads reliably
- *
- * Architecture (rendered bottom-to-top):
- *   1. Google Satellite (raster base — TRUE COLOR, proxied via /api/tiles/satellite)
- *   2. OpenFreeMap Water (vector fill)
- *   3. OpenFreeMap Landuse (vector, subtle fill)
- *   4. Sky layer (atmospheric gradient)
- *   5. 3D Buildings — OpenFreeMap vector (fill-extrusion with render_height)
- *   6. 3D Buildings — OSM Overpass GeoJSON supplement (fill-extrusion)
- *   7. OpenFreeMap Roads (vector lines)
- *   8. Delivery route (geojson line)
- *   9. CARTO Labels (raster overlay)
+ * Build Overpass QL query for buildings in a bounding box
  */
-
-import type { StyleSpecification } from 'maplibre-gl'
-
-// ============================================
-// TILE SOURCE DEFINITIONS
-// ============================================
-
-export const SATELLITE_SOURCES = {
-  /**
-   * Google Maps Satellite — TRUE COLOR, proxied via server-side API route.
-   * This bypasses CORS restrictions and direct-access blocking that causes
-   * satellite tiles to fail silently in the browser (resulting in the
-   * infra-red appearance from vector-only layers).
-   *
-   * The proxy route at /api/tiles/satellite fetches tiles server-side and
-   * serves them to the client with proper headers and caching.
-   */
-  google: {
-    id: 'google-satellite',
-    url: '/api/tiles/satellite?z={z}&x={x}&y={y}',
-    maxzoom: 20,
-    attribution: 'Google Maps',
-  },
-  /**
-   * ESRI World Imagery — may show infrared for some African regions.
-   * NOT recommended for Kampala. Available as an explicit choice only.
-   * Do NOT use as a fallback for Google.
-   */
-  esri: {
-    id: 'esri-world',
-    url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-    maxzoom: 19,
-    attribution: 'Esri, Maxar, Earthstar Geographics',
-  },
-  /**
-   * ESRI Clarity — KNOWN to show infrared in Kampala.
-   * Do NOT use as a fallback for Google.
-   */
-  esriClarity: {
-    id: 'esri-clarity',
-    url: 'https://clarity.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-    maxzoom: 19,
-    attribution: 'Esri',
-  },
-} as const
-
-export const VECTOR_SOURCES = {
-  /** OpenFreeMap planet vector tiles — buildings with render_height, roads, water, landuse */
-  openfreemap: {
-    id: 'openfreemap',
-    url: 'https://tiles.openfreemap.org/planet/{z}/{x}/{y}.pbf',
-    maxzoom: 14, // OpenFreeMap max detail zoom; MapLibre overzooms beyond this
-    attribution: 'OpenFreeMap, OpenMapTiles, OpenStreetMap',
-  },
-} as const
-
-export const LABEL_SOURCES = {
-  light: {
-    id: 'carto-light-labels',
-    url: 'https://a.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}@2x.png',
-    maxzoom: 19,
-    attribution: 'CARTO',
-  },
-  dark: {
-    id: 'carto-dark-labels',
-    url: 'https://a.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}@2x.png',
-    maxzoom: 19,
-    attribution: 'CARTO',
-  },
-} as const
-
-export const MAP_2D_SOURCES = {
-  voyager: {
-    id: 'carto-voyager',
-    url: 'https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}@2x.png',
-    maxzoom: 19,
-    attribution: 'CARTO, OpenStreetMap',
-  },
-  positron: {
-    id: 'carto-positron',
-    url: 'https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}@2x.png',
-    maxzoom: 19,
-    attribution: 'CARTO, OpenStreetMap',
-  },
-  darkMatter: {
-    id: 'carto-dark-matter',
-    url: 'https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png',
-    maxzoom: 19,
-    attribution: 'CARTO, OpenStreetMap',
-  },
-} as const
-
-// ============================================
-// STYLE CONFIGURATION TYPES
-// ============================================
-
-export interface MapStyleConfig {
-  nightMode: boolean
-  buildingHeightExaggeration: number  // 1.0 = real, 2.0 = double height
-  showBuildings: boolean
-  showRoads: boolean
-  showWater: boolean
-  showLabels: boolean
-  showSatellite: boolean
-  showSky: boolean
-  buildingOpacity: number
-  satelliteOpacity: number
-  roadOpacity: number
-  labelOpacity: number
-  /** Which satellite source to use: 'google' (true-color, proxied), 'esri', or 'esriClarity' */
-  satelliteSource: 'google' | 'esri' | 'esriClarity'
+function buildOverpassQuery(bbox: string): string {
+  // bbox format: south,west,north,east (lat,lng)
+  return `
+[out:json][timeout:25];
+(
+  way["building"](${bbox});
+  relation["building"](${bbox});
+);
+out body;
+>;
+out skel qt;
+`
 }
 
-export const DEFAULT_MAP_CONFIG: MapStyleConfig = {
-  nightMode: false,
-  buildingHeightExaggeration: 2.0,     // FIXED: was 1.0, now 2.0 for Kampala where height data is sparse
-  showBuildings: true,
-  showRoads: true,
-  showWater: true,
-  showLabels: true,
-  showSatellite: true,
-  showSky: true,
-  buildingOpacity: 0.88,               // FIXED: was 0.75, now 0.88 for better visibility
-  satelliteOpacity: 1.0,
-  roadOpacity: 0.85,
-  labelOpacity: 0.7,
-  satelliteSource: 'google',            // FIXED: Google satellite via proxy = true-color, no ESRI fallback
-}
+/**
+ * Convert Overpass API response to GeoJSON
+ */
+function overpassToGeoJSON(data: {
+  elements: Array<{
+    type: string
+    id: number
+    lat?: number
+    lon?: number
+    tags?: Record<string, string>
+    nodes?: number[]
+  }>
+}): {
+  type: string
+  features: Array<{
+    type: string
+    id: string
+    geometry: {
+      type: string
+      coordinates: number[][]
+    }
+    properties: Record<string, unknown>
+  }>
+} {
+  // Build node lookup for ways
+  const nodes = new Map<number, { lat: number; lon: number }>()
+  data.elements
+    .filter(el => el.type === 'node')
+    .forEach(el => {
+      if (el.lat !== undefined && el.lon !== undefined) {
+        nodes.set(el.id, { lat: el.lat, lon: el.lon })
+      }
+    })
 
-// ============================================
-// HELPER: Get satellite source by config
-// ============================================
+  // Convert ways to GeoJSON features
+  const features = data.elements
+    .filter(el => el.type === 'way' && el.tags?.building)
+    .map(way => {
+      const coords = (way.nodes || [])
+        .map(nodeId => {
+          const node = nodes.get(nodeId)
+          return node ? [node.lon, node.lat] : null
+        })
+        .filter(Boolean) as number[][]
 
-function getSatelliteSource(source: MapStyleConfig['satelliteSource']) {
-  switch (source) {
-    case 'google': return SATELLITE_SOURCES.google
-    case 'esri': return SATELLITE_SOURCES.esri
-    case 'esriClarity': return SATELLITE_SOURCES.esriClarity
-    default: return SATELLITE_SOURCES.google  // No fallback — Google is the default
+      // Close the polygon if not already closed
+      if (coords.length > 0 && coords[0] !== coords[coords.length - 1]) {
+        coords.push(coords[0])
+      }
+
+      // Parse height data
+      const tags = way.tags || {}
+      const height = parseHeight(tags.height, tags['building:levels'])
+
+      return {
+        type: 'Feature',
+        id: `building-${way.id}`,
+        geometry: {
+          type: 'Polygon',
+          coordinates: [coords],
+        },
+        properties: {
+          id: way.id,
+          building: tags.building || 'yes',
+          name: tags.name || null,
+          height: height,
+          min_height: parseHeight(tags.min_height, null),
+          levels: tags['building:levels'] ? parseInt(tags['building:levels']) : null,
+          render_height: height,
+          render_min_height: parseHeight(tags.min_height, null) || 0,
+          class: classifyBuilding(tags),
+        },
+      }
+    })
+
+  return {
+    type: 'FeatureCollection',
+    features,
   }
 }
 
-export function getLabelSource(nightMode: boolean) {
-  return nightMode ? LABEL_SOURCES.dark : LABEL_SOURCES.light
+/**
+ * Parse height from OSM tags
+ * Accepts formats: "15", "15 m", "15m", "5 stories"
+ */
+function parseHeight(heightStr?: string, levelsStr?: string | null): number {
+  if (heightStr) {
+    // Try direct number
+    const direct = parseFloat(heightStr)
+    if (!isNaN(direct)) return direct
+
+    // Try "15 m" or "15m" format
+    const withUnit = heightStr.match(/^([\d.]+)\s*m/)
+    if (withUnit) return parseFloat(withUnit[1])
+  }
+
+  // Estimate from levels (3m per level)
+  if (levelsStr) {
+    const levels = parseInt(levelsStr)
+    if (!isNaN(levels)) return levels * 3
+  }
+
+  // FIXED: Default height for unmapped buildings changed from 5m to 12m
+  // to match the coalesce default in sources.ts build3DMapStyle()
+  return 12
 }
 
-// ============================================
-// ENHANCED MAPLIBRE STYLE BUILDER
-// ============================================
-
 /**
- * Build the complete MapLibre style object for the 3D map.
- *
- * FIXED: Google satellite proxied via /api/tiles/satellite for reliable loading.
- * FIXED: Building colors vibrant high-contrast against satellite imagery.
- * FIXED: Building height exaggeration default 2.0 for sparse height data.
- * FIXED: Building minzoom lowered from 13 to 11.
- * FIXED: Building fallback height from 5m to 12m.
+ * Classify building type for styling
  */
-export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpecification {
-  const c = { ...DEFAULT_MAP_CONFIG, ...config }
-  const satSource = getSatelliteSource(c.satelliteSource)
-  const heightMultiplier = c.buildingHeightExaggeration
-
-  return {
-    version: 8 as const,
-    sources: {
-      // Base satellite imagery — FIXED: Google proxied for reliable true-color
-      'satellite': {
-        type: 'raster' as const,
-        tiles: [satSource.url],
-        tileSize: 256,
-        maxzoom: satSource.maxzoom,
-        attribution: satSource.attribution,
-      },
-      // OpenFreeMap vector tiles for buildings, roads, water
-      'openmaptiles': {
-        type: 'vector',
-        tiles: [VECTOR_SOURCES.openfreemap.url],
-        maxzoom: VECTOR_SOURCES.openfreemap.maxzoom,
-        attribution: VECTOR_SOURCES.openfreemap.attribution,
-      },
-      // Label overlay
-      'labels': {
-        type: 'raster' as const,
-        tiles: [getLabelSource(c.nightMode).url],
-        tileSize: 256,
-        maxzoom: 19,
-      },
-    },
-    // Sky layer for atmospheric rendering
-    sky: c.showSky ? {
-      'sky-color': c.nightMode ? '#0a0a1a' : '#88bbee',
-      'horizon-color': c.nightMode ? '#1a1a2e' : '#b8d4e8',
-      'fog-color': c.nightMode ? '#1a1a2e' : '#c8dce8',
-      'fog-ground-blend': 0.9,
-      'horizon-fog-blend': 0.4,
-      'sky-horizon-blend': 0.6,
-      'atmosphere-blend': c.nightMode
-        ? ['interpolate', ['linear'], ['zoom'], 0, 0.3, 14, 0.1, 18, 0.05]
-        : ['interpolate', ['linear'], ['zoom'], 0, 0.5, 14, 0.3, 18, 0.15],
-    } : undefined,
-    // Light configuration for 3D building rendering
-    light: {
-      anchor: 'viewport',
-      color: c.nightMode ? '#334466' : '#ffffff',
-      intensity: c.nightMode ? 0.4 : 0.6,
-      position: c.nightMode
-        ? [1.15, 210, 30]  // Moonlight from southwest
-        : [1.15, 90, 30],   // Sunlight from east (morning in Kampala)
-    },
-    layers: [
-      // 1. Satellite base
-      ...(c.showSatellite ? [{
-        id: 'satellite-layer',
-        type: 'raster' as const,
-        source: 'satellite',
-        minzoom: 0,
-        maxzoom: 20,
-        paint: {
-          'raster-opacity': c.satelliteOpacity,
-          'raster-brightness-max': c.nightMode ? 0.6 : 1.0,
-          'raster-saturation': c.nightMode ? 0.3 : 1.0,
-        },
-      }] : []),
-
-      // 2. Water features
-      ...(c.showWater ? [{
-        id: 'water',
-        type: 'fill' as const,
-        source: 'openmaptiles',
-        'source-layer': 'water',
-        paint: {
-          'fill-color': c.nightMode ? '#0a1628' : '#7cb5d4',
-          'fill-opacity': 0.7,
-        },
-      }] : []),
-
-      // 3. Landuse — subtle fills for urban areas
-      {
-        id: 'landuse',
-        type: 'fill' as const,
-        source: 'openmaptiles',
-        'source-layer': 'landuse',
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        filter: ['in', 'class', 'residential', 'suburban', 'neighbourhood'] as any,
-        paint: {
-          'fill-color': c.nightMode ? '#1a1a2e' : '#d4e6d4',
-          'fill-opacity': c.nightMode ? 0.2 : 0.12,
-        },
-      },
-
-      // 4. 3D Buildings — FIXED: vibrant colors, lower minzoom, higher default height
-      ...(c.showBuildings ? [
-        {
-          id: '3d-buildings',
-          type: 'fill-extrusion' as const,
-          source: 'openmaptiles',
-          'source-layer': 'building',
-          minzoom: 11,                      // FIXED: was 13, now 11 for earlier visibility
-          paint: {
-            // FIXED: Changed from muted gray to VIBRANT, high-contrast colors
-            // that stand out clearly against satellite imagery
-            'fill-extrusion-color': c.nightMode
-              ? [
-                  'interpolate', ['linear'], ['get', 'render_height'],
-                  0, '#4a6fa5',      // Deep blue — ground/short
-                  10, '#5b82b8',     // Medium blue
-                  20, '#6c95cb',     // Blue
-                  40, '#7da8de',     // Light blue
-                  60, '#8ebbef',     // Bright blue
-                  80, '#9fcfff',     // Sky blue
-                  100, '#b0e0ff',    // Ice blue — tall/skyscraper
-                ]
-              : [
-                  'interpolate', ['linear'], ['get', 'render_height'],
-                  0, '#e8a838',      // Warm orange — ground/short (HIGHEST CONTRAST vs green satellite)
-                  10, '#e0922e',     // Deep orange
-                  20, '#d87c24',     // Burnt orange
-                  40, '#c46820',     // Rust
-                  60, '#b0541c',     // Brown-orange
-                  80, '#9c4018',     // Deep brown
-                  100, '#882c14',    // Dark mahogany — tall/skyscraper
-                ],
-            // FIXED: Height fallback from 5m to 12m for Kampala sparse data
-            'fill-extrusion-height': [
-              '*',
-              ['coalesce', ['get', 'render_height'], 12],   // FIXED: was 5, now 12
-              heightMultiplier,
-            ],
-            'fill-extrusion-base': [
-              '*',
-              ['coalesce', ['get', 'render_min_height'], 0],
-              heightMultiplier,
-            ],
-            'fill-extrusion-opacity': c.buildingOpacity,
-          },
-        },
-        // Building outline layer for better definition
-        {
-          id: 'building-outline',
-          type: 'line' as const,
-          source: 'openmaptiles',
-          'source-layer': 'building',
-          minzoom: 14,                      // Lowered from 15 to 14
-          paint: {
-            'line-color': c.nightMode ? '#5a5a7a' : '#ffffff',
-            'line-width': [
-              'interpolate', ['linear'], ['zoom'],
-              14, 0.4,
-              16, 1.0,
-              18, 2.0,
-            ],
-            'line-opacity': 0.5,
-          },
-        },
-      ] : []),
-
-      // 5. Road network
-      ...(c.showRoads ? [
-        // Major roads (primary, trunk)
-        {
-          id: 'road-major-casing',
-          type: 'line' as const,
-          source: 'openmaptiles',
-          'source-layer': 'transportation',
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          filter: ['in', 'class', 'primary', 'trunk', 'motorway'] as any,
-          paint: {
-            'line-color': c.nightMode ? '#1a1a2e' : '#ffffff',
-            'line-width': [
-              'interpolate', ['linear'], ['zoom'],
-              10, 1,
-              12, 2,
-              14, 5,
-              16, 10,
-              18, 18,
-            ],
-            'line-opacity': 0.6,
-          },
-        },
-        {
-          id: 'road-major',
-          type: 'line' as const,
-          source: 'openmaptiles',
-          'source-layer': 'transportation',
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          filter: ['in', 'class', 'primary', 'trunk', 'motorway'] as any,
-          paint: {
-            'line-color': c.nightMode ? '#4a4a60' : '#f0e68c',
-            'line-width': [
-              'interpolate', ['linear'], ['zoom'],
-              10, 0.5,
-              12, 1,
-              14, 3,
-              16, 6,
-              18, 12,
-            ],
-            'line-opacity': c.roadOpacity,
-          },
-        },
-        // Secondary & tertiary roads
-        {
-          id: 'road-secondary',
-          type: 'line' as const,
-          source: 'openmaptiles',
-          'source-layer': 'transportation',
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          filter: ['in', 'class', 'secondary', 'tertiary'] as any,
-          paint: {
-            'line-color': c.nightMode ? '#3a3a50' : '#ffffff',
-            'line-width': [
-              'interpolate', ['linear'], ['zoom'],
-              12, 0.5,
-              14, 2,
-              16, 4,
-              18, 8,
-            ],
-            'line-opacity': c.roadOpacity * 0.9,
-          },
-        },
-        // Minor roads
-        {
-          id: 'road-minor',
-          type: 'line' as const,
-          source: 'openmaptiles',
-          'source-layer': 'transportation',
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          filter: ['in', 'class', 'minor', 'service', 'path', 'track'] as any,
-          paint: {
-            'line-color': c.nightMode ? '#2a2a3e' : '#e0e0e0',
-            'line-width': [
-              'interpolate', ['linear'], ['zoom'],
-              14, 0.3,
-              16, 1.5,
-              18, 3,
-            ],
-            'line-opacity': 0.5,
-          },
-        },
-      ] : []),
-
-      // 6. Label overlay
-      ...(c.showLabels ? [{
-        id: 'labels-layer',
-        type: 'raster' as const,
-        source: 'labels',
-        minzoom: 10,
-        maxzoom: 19,
-        paint: {
-          'raster-opacity': c.labelOpacity,
-        },
-      }] : []),
-    ].filter(Boolean),
-  } as StyleSpecification
+function classifyBuilding(tags: Record<string, string>): string {
+  if (tags.building === 'residential' || tags.building === 'apartments') return 'residential'
+  if (tags.building === 'commercial' || tags.building === 'retail') return 'commercial'
+  if (tags.building === 'industrial') return 'industrial'
+  if (tags.building === 'office') return 'office'
+  if (tags.building === 'hospital') return 'hospital'
+  if (tags.building === 'school' || tags.building === 'university') return 'education'
+  if (tags.building === 'church' || tags.building === 'mosque' || tags.building === 'cathedral') return 'religious'
+  return 'other'
 }
 
-// ============================================
-// OSM BUILDINGS GEOJSON LOADER
-// ============================================
-
-/**
- * Fetch building GeoJSON from the OSM Overpass API route.
- * This supplements the OpenFreeMap vector tile buildings with
- * potentially more complete data for Kampala.
- *
- * FIXED: Timeout increased from 15s to 30s to match the Overpass API
- * server-side timeout of 25s. The previous 15s timeout was causing
- * TimeoutError (code 23) because Overpass responses for Kampala
- * typically take 12-18 seconds.
- */
-export async function fetchOSMBuildings(
-  bounds: { south: number; west: number; north: number; east: number }
-): Promise<GeoJSON.FeatureCollection | null> {
+export async function GET(request: NextRequest) {
   try {
-    const bbox = `${bounds.south},${bounds.west},${bounds.north},${bounds.east}`
-    const response = await fetch(`/api/osm/buildings?bbox=${bbox}`, {
-      signal: AbortSignal.timeout(30000),  // FIXED: was 15000, now 30000 to match Overpass API 25s timeout
+    const { searchParams } = new URL(request.url)
+    const bbox = searchParams.get('bbox')
+
+    if (!bbox) {
+      return NextResponse.json(
+        { error: 'Missing required parameter: bbox (format: south,west,north,east)' },
+        { status: 400 }
+      )
+    }
+
+    // Validate bbox format
+    const parts = bbox.split(',').map(Number)
+    if (parts.length !== 4 || parts.some(isNaN)) {
+      return NextResponse.json(
+        { error: 'Invalid bbox format. Expected: south,west,north,east' },
+        { status: 400 }
+      )
+    }
+
+    // Check cache
+    const cacheKey = bbox
+    const cached = buildingCache.get(cacheKey)
+    if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+      return NextResponse.json(cached.data, {
+        headers: {
+          'Cache-Control': 'public, max-age=21600',
+          'X-Cache': 'HIT',
+        },
+      })
+    }
+
+    // Query Overpass API
+    const query = buildOverpassQuery(bbox)
+    const response = await fetch(OVERPASS_API, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'DirectDDL/6.0',
+      },
+      body: `data=${encodeURIComponent(query)}`,
+      signal: AbortSignal.timeout(25000),
     })
 
     if (!response.ok) {
-      console.error(`[OSM Buildings] Fetch failed: ${response.status} ${response.statusText}`)
-      return null
+      console.error('[OSM Buildings] Overpass API error:', response.status)
+      return NextResponse.json(
+        { error: 'Overpass API request failed', status: response.status },
+        { status: response.status }
+      )
     }
 
-    const data = await response.json()
-    console.log(`[OSM Buildings] Loaded ${data.features?.length || 0} buildings from Overpass API`)
-    return data
+    const overpassData = await response.json()
+    const geojson = overpassToGeoJSON(overpassData)
+
+    // Cache result
+    buildingCache.set(cacheKey, { data: geojson, timestamp: Date.now() })
+
+    return NextResponse.json(geojson, {
+      headers: {
+        'Cache-Control': 'public, max-age=21600',
+        'X-Cache': 'MISS',
+        'X-Building-Count': geojson.features.length.toString(),
+      },
+    })
+
   } catch (error) {
-    // Log the error clearly — don't silently swallow it
-    if (error instanceof DOMException && error.name === 'TimeoutError') {
-      console.error('[OSM Buildings] Request timed out after 30s. The Overpass API may be overloaded.')
-    } else {
-      console.error('[OSM Buildings] Fetch error:', error)
+    console.error('[OSM Buildings] Error:', error)
+
+    if (error instanceof Error && error.name === 'AbortError') {
+      return NextResponse.json(
+        { error: 'Overpass API request timed out' },
+        { status: 504 }
+      )
     }
-    return null
+
+    return NextResponse.json(
+      { error: 'Building data fetch failed' },
+      { status: 500 }
+    )
   }
 }
-
-/**
- * Add OSM Overpass building data as a supplementary GeoJSON layer on the map.
- * This ensures buildings are visible even if OpenFreeMap tiles are sparse.
- */
-export function addOSMBuildingLayer(
-  map: maplibregl.Map,
-  geojson: GeoJSON.FeatureCollection,
-  config: Partial<MapStyleConfig> = {}
-): void {
-  const c = { ...DEFAULT_MAP_CONFIG, ...config }
-
-  // Remove existing OSM buildings layer/source if present
-  if (map.getLayer('osm-buildings-3d')) map.removeLayer('osm-buildings-3d')
-  if (map.getLayer('osm-building-outline')) map.removeLayer('osm-building-outline')
-  if (map.getSource('osm-buildings')) map.removeSource('osm-buildings')
-
-  // Add GeoJSON source
-  map.addSource('osm-buildings', {
-    type: 'geojson',
-    data: geojson as any,
-  })
-
-  // Add 3D extrusion layer — same vibrant colors as vector tile buildings
-  map.addLayer({
-    id: 'osm-buildings-3d',
-    type: 'fill-extrusion',
-    source: 'osm-buildings',
-    minzoom: 11,
-    paint: {
-      'fill-extrusion-color': c.nightMode
-        ? [
-            'interpolate', ['linear'], ['get', 'render_height'],
-            0, '#4a6fa5',
-            10, '#5b82b8',
-            20, '#6c95cb',
-            40, '#7da8de',
-            60, '#8ebbef',
-            100, '#b0e0ff',
-          ]
-        : [
-            'interpolate', ['linear'], ['get', 'render_height'],
-            0, '#e8a838',
-            10, '#e0922e',
-            20, '#d87c24',
-            40, '#c46820',
-            60, '#b0541c',
-            80, '#9c4018',
-            100, '#882c14',
-          ],
-      'fill-extrusion-height': [
-        '*',
-        ['coalesce', ['get', 'render_height'], 12],
-        c.buildingHeightExaggeration,
-      ],
-      'fill-extrusion-base': [
-        '*',
-        ['coalesce', ['get', 'render_min_height'], 0],
-        c.buildingHeightExaggeration,
-      ],
-      'fill-extrusion-opacity': c.buildingOpacity,
-    },
-  })
-
-  // Add outline for OSM buildings
-  map.addLayer({
-    id: 'osm-building-outline',
-    type: 'line',
-    source: 'osm-buildings',
-    minzoom: 14,
-    paint: {
-      'line-color': c.nightMode ? '#5a5a7a' : '#ffffff',
-      'line-width': [
-        'interpolate', ['linear'], ['zoom'],
-        14, 0.3,
-        16, 0.8,
-        18, 1.5,
-      ],
-      'line-opacity': 0.4,
-    },
-  })
-}
-
-// ============================================
-// KAMPALA-SPECIFIC MAP DEFAULTS
-// ============================================
-
-/** Default center on Nakasero Market, Kampala */
-export const KAMPALA_CENTER: [number, number] = [32.5814, 0.3152] // [lng, lat]
-
-/** Default map camera settings for 3D view */
-export const DEFAULT_3D_CAMERA = {
-  center: KAMPALA_CENTER,
-  zoom: 14.5,
-  pitch: 55,
-  bearing: -20,
-  maxPitch: 85,
-  minZoom: 10,
-  maxZoom: 18,
-} as const
-
-/** Default map camera settings for navigation view */
-export const NAVIGATION_CAMERA = {
-  center: KAMPALA_CENTER,
-  zoom: 16,
-  pitch: 70,
-  bearing: 0,
-  maxPitch: 85,
-  minZoom: 14,
-  maxZoom: 18,
-} as const
-
-/** Kampala bounding box for restricting map view */
-export const KAMPALA_BOUNDS: [[number, number], [number, number]] = [
-  [32.44, 0.22],  // SW corner [lng, lat]
-  [32.72, 0.42],  // NE corner [lng, lat]
-]

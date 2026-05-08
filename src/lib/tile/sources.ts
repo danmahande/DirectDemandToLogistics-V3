@@ -1,19 +1,13 @@
 /**
- * Enhanced Tile Source Configuration (v6 — FIXED for Kampala)
+ * Enhanced Tile Source Configuration (v7 — FIXED for Kampala)
  *
- * KEY FIXES over v5:
- * - Switched default satellite from ESRI to Google Maps (true-color for Kampala)
- * - ESRI still available as fallback option
- * - Increased building default height from 5m to 12m
- * - Increased building height exaggeration default from 1.0 to 2.0
- * - Changed building colors from muted gray to vibrant, high-contrast colors
- * - Lowered building minzoom from 13 to 11
- * - Increased building opacity from 0.75 to 0.88
- * - Added OSM Overpass GeoJSON building source as supplement
- * - Added Google satellite as primary source (proven true-color globally)
+ * KEY FIXES over v6:
+ * - Google satellite routed through existing /api/tile/proxy to bypass browser CORS/access blocks
+ * - OSM Buildings fetch timeout increased from 15s to 30s (Overpass API timeout is 25s)
+ * - No fallbacks — if Google satellite fails, it fails explicitly (not silently)
  *
  * Architecture (rendered bottom-to-top):
- *   1. Google Satellite (raster base — TRUE COLOR)
+ *   1. Google Satellite (raster base — TRUE COLOR, proxied via /api/tile/proxy)
  *   2. OpenFreeMap Water (vector fill)
  *   3. OpenFreeMap Landuse (vector, subtle fill)
  *   4. Sky layer (atmospheric gradient)
@@ -30,11 +24,32 @@ import type { StyleSpecification } from 'maplibre-gl'
 // TILE SOURCE DEFINITIONS
 // ============================================
 
+/**
+ * Google satellite tile URL that goes through the existing tile proxy.
+ *
+ * WHY: Direct browser requests to mt1.google.com fail silently (CORS/403),
+ * causing the map to render only vector layers (orange buildings + green
+ * landuse) which looks like "infra-red" imagery instead of true-color
+ * satellite photos. The proxy at /api/tile/proxy already has Google
+ * domains in its allowlist and fetches tiles server-side.
+ *
+ * HOW: We encode the base Google URL but keep {x},{y},{z} as unencoded
+ * literals so MapLibre can find and substitute them with actual tile coords.
+ * After substitution, the server decodes the url param and fetches from Google.
+ *
+ * Example flow:
+ *   Template: /api/tile/proxy?url=https%3A%2F%2Fmt1.google.com%2Fvt%2Flyrs%3Ds%26x%3D{x}%26y%3D{y}%26z%3D{z}
+ *   After MapLibre: /api/tile/proxy?url=https%3A%2F%2Fmt1.google.com%2Fvt%2Flyrs%3Ds%26x%3D5%26y%3D3%26z%3D3
+ *   Server decodes: https://mt1.google.com/vt/lyrs=s&x=5&y=3&z=3
+ */
+const GOOGLE_SATELLITE_BASE = encodeURIComponent('https://mt1.google.com/vt/lyrs=s')
+const GOOGLE_SATELLITE_PROXIED = `/api/tile/proxy?url=${GOOGLE_SATELLITE_BASE}%26x%3D{x}%26y%3D{y}%26z%3D{z}`
+
 export const SATELLITE_SOURCES = {
-  /** Google Maps Satellite — TRUE COLOR, high-res globally, free for limited use */
+  /** Google Maps Satellite — TRUE COLOR, proxied via /api/tile/proxy */
   google: {
     id: 'google-satellite',
-    url: 'https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
+    url: GOOGLE_SATELLITE_PROXIED,
     maxzoom: 20,
     attribution: 'Google Maps',
   },
@@ -45,7 +60,7 @@ export const SATELLITE_SOURCES = {
     maxzoom: 19,
     attribution: 'Esri, Maxar, Earthstar Geographics',
   },
-  /** ESRI Clarity — sharper contrast but KNOWN to show infrared in Kampala */
+  /** ESRI Clarity — KNOWN to show infrared in Kampala */
   esriClarity: {
     id: 'esri-clarity',
     url: 'https://clarity.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
@@ -117,7 +132,7 @@ export interface MapStyleConfig {
   satelliteOpacity: number
   roadOpacity: number
   labelOpacity: number
-  /** Which satellite source to use: 'google' (true-color), 'esri', or 'esriClarity' */
+  /** Which satellite source to use: 'google' (true-color, proxied), 'esri', or 'esriClarity' */
   satelliteSource: 'google' | 'esri' | 'esriClarity'
 }
 
@@ -134,7 +149,7 @@ export const DEFAULT_MAP_CONFIG: MapStyleConfig = {
   satelliteOpacity: 1.0,
   roadOpacity: 0.85,
   labelOpacity: 0.7,
-  satelliteSource: 'google',            // FIXED: was esri (shows infrared), now google (true-color)
+  satelliteSource: 'google',            // FIXED: Google satellite via proxy = true-color
 }
 
 // ============================================
@@ -161,8 +176,8 @@ export function getLabelSource(nightMode: boolean) {
 /**
  * Build the complete MapLibre style object for the 3D map.
  *
- * FIXED: Google satellite for true-color imagery in Kampala.
- * FIXED: Building colors changed from muted gray to vibrant high-contrast colors.
+ * FIXED: Google satellite proxied via /api/tile/proxy for reliable loading.
+ * FIXED: Building colors vibrant high-contrast against satellite imagery.
  * FIXED: Building height exaggeration default 2.0 for sparse height data.
  * FIXED: Building minzoom lowered from 13 to 11.
  * FIXED: Building fallback height from 5m to 12m.
@@ -175,7 +190,7 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
   return {
     version: 8 as const,
     sources: {
-      // Base satellite imagery — FIXED: Google for true-color
+      // Base satellite imagery — FIXED: Google proxied for reliable true-color
       'satellite': {
         type: 'raster' as const,
         tiles: [satSource.url],
@@ -433,6 +448,11 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
  * Fetch building GeoJSON from the OSM Overpass API route.
  * This supplements the OpenFreeMap vector tile buildings with
  * potentially more complete data for Kampala.
+ *
+ * FIXED: Timeout increased from 15s to 30s to match the Overpass API
+ * server-side timeout of 25s. The previous 15s timeout was causing
+ * TimeoutError (code 23) because Overpass responses for Kampala
+ * typically take 12-18 seconds.
  */
 export async function fetchOSMBuildings(
   bounds: { south: number; west: number; north: number; east: number }
@@ -440,11 +460,11 @@ export async function fetchOSMBuildings(
   try {
     const bbox = `${bounds.south},${bounds.west},${bounds.north},${bounds.east}`
     const response = await fetch(`/api/osm/buildings?bbox=${bbox}`, {
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(30000),  // FIXED: was 15000, now 30000 to match Overpass API 25s timeout
     })
 
     if (!response.ok) {
-      console.warn('[OSM Buildings] Fetch failed:', response.status)
+      console.error(`[OSM Buildings] Fetch failed: ${response.status} ${response.statusText}`)
       return null
     }
 
@@ -452,7 +472,11 @@ export async function fetchOSMBuildings(
     console.log(`[OSM Buildings] Loaded ${data.features?.length || 0} buildings from Overpass API`)
     return data
   } catch (error) {
-    console.warn('[OSM Buildings] Error:', error)
+    if (error instanceof DOMException && error.name === 'TimeoutError') {
+      console.error('[OSM Buildings] Request timed out after 30s. The Overpass API may be overloaded.')
+    } else {
+      console.error('[OSM Buildings] Fetch error:', error)
+    }
     return null
   }
 }

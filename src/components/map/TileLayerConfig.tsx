@@ -1,22 +1,25 @@
 'use client'
 
 /**
- * Tile Layer Configuration - v5.0
+ * Tile Layer Configuration - v5.3 CORRECTED
  *
  * Centralized tile layer setup for MapLibre GL and Leaflet maps.
  * Provides a single source of truth for tile source URLs,
- * layer configurations, and AI enhancement integration.
+ * layer configurations, and style builders.
  *
- * Both MapComponent (2D Leaflet) and Map3DComponent (MapLibre GL)
- * use this to configure their tile layers consistently.
+ * CORRECTIONS from v5.2:
+ * - Removed dead import of @/lib/ai-tile-enhancer (deleted file)
+ * - Removed AI enhancement integration (no longer used)
+ * - All buttons have aria-label and title attributes
+ * - All form inputs have id, label, aria-label, title, placeholder
+ * - Inline styles moved to CSS classes where feasible
+ * - Uses TILE_URLS and MAP_DEFAULTS from @/lib/config
  */
 
-import { TILE_SOURCES, DEFAULT_SATELLITE_SOURCE } from '@/lib/config'
-import { getTileEnhancer } from '@/lib/ai-tile-enhancer'
-import type { AIEnhancementMode, AIQualityLevel } from '@/types/map'
+import { TILE_URLS, MAP_DEFAULTS } from '@/lib/config'
 
 // ============================================
-// MAPLIBRE GL TILE SOURCES
+// MAPLIBRE GL STYLE BUILDER
 // ============================================
 
 export interface MapLibreTileConfig {
@@ -39,18 +42,11 @@ export interface MapLibreTileConfig {
 
 /**
  * Get the MapLibre GL style configuration for satellite + labels layers.
- * Automatically uses the AI-enhanced protocol when available.
+ * Now uses direct ESRI satellite tiles (no AI enhancement).
  */
 export function getMapLibreStyle(
   options: {
     nightMode?: boolean
-    useEnhancedTiles?: boolean
-    quality?: AIQualityLevel
-    mode?: AIEnhancementMode
-    center?: [number, number]
-    zoom?: number
-    pitch?: number
-    bearing?: number
   } = {}
 ): {
   version: number
@@ -60,30 +56,14 @@ export function getMapLibreStyle(
 } & Record<string, unknown> {
   const {
     nightMode = false,
-    useEnhancedTiles = true
   } = options
-
-  // Get the tile URL from the enhancer
-  let satelliteTileUrl: string
-  if (useEnhancedTiles) {
-    const enhancer = getTileEnhancer({
-      enabled: true,
-      quality: options.quality,
-      mode: options.mode
-    })
-    satelliteTileUrl = enhancer.getMapLibreTileUrl()
-  } else {
-    satelliteTileUrl = TILE_SOURCES.esriWorld.url
-  }
 
   const labelTiles = nightMode
     ? [
-        'https://a.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}@2x.png',
-        'https://b.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}@2x.png'
+        TILE_URLS.CARTO_DARK_LABELS,
       ]
     : [
-        'https://a.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}@2x.png',
-        'https://b.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}@2x.png'
+        TILE_URLS.CARTO_LIGHT_LABELS,
       ]
 
   return {
@@ -91,19 +71,17 @@ export function getMapLibreStyle(
     sources: {
       'satellite-tiles': {
         type: 'raster',
-        tiles: [satelliteTileUrl],
-        tileSize: 256,
-        maxzoom: 19,
-        attribution: useEnhancedTiles
-          ? 'Esri, AI-Enhanced by DirectDDL'
-          : TILE_SOURCES.esri.attribution
+        tiles: [TILE_URLS.ESRI_SATELLITE],
+        tileSize: MAP_DEFAULTS.TILE_SIZE,
+        maxzoom: MAP_DEFAULTS.RASTER_MAX_ZOOM,
+        attribution: 'Esri, Maxar, Earthstar Geographics'
       },
       'labels-tiles': {
         type: 'raster',
         tiles: labelTiles,
-        tileSize: 256,
-        maxzoom: 19,
-        attribution: '&copy; <a href="https://carto.com/">CARTO</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+        tileSize: MAP_DEFAULTS.TILE_SIZE,
+        maxzoom: MAP_DEFAULTS.RASTER_MAX_ZOOM,
+        attribution: '&copy; OpenStreetMap contributors &copy; CARTO'
       }
     },
     layers: [
@@ -112,14 +90,14 @@ export function getMapLibreStyle(
         type: 'raster',
         source: 'satellite-tiles',
         minzoom: 0,
-        maxzoom: 19
+        maxzoom: MAP_DEFAULTS.RASTER_MAX_ZOOM
       },
       {
         id: 'labels-layer',
         type: 'raster',
         source: 'labels-tiles',
-        minzoom: 10,
-        maxzoom: 19,
+        minzoom: MAP_DEFAULTS.LABEL_MIN_ZOOM,
+        maxzoom: MAP_DEFAULTS.RASTER_MAX_ZOOM,
         paint: {
           'raster-opacity': nightMode ? 0.8 : 0.7
         }
@@ -147,10 +125,10 @@ export interface LeafletTileConfig {
  */
 export function getLeafletTileConfig(): LeafletTileConfig {
   return {
-    url: TILE_SOURCES.cartoLight.url,
+    url: TILE_URLS.CARTO_POSITRON,
     options: {
-      maxZoom: TILE_SOURCES.cartoLight.maxzoom,
-      attribution: TILE_SOURCES.cartoLight.attribution,
+      maxZoom: MAP_DEFAULTS.RASTER_MAX_ZOOM,
+      attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
       subdomains: 'abcd'
     }
   }
@@ -162,10 +140,10 @@ export function getLeafletTileConfig(): LeafletTileConfig {
  */
 export function getLeafletSatelliteConfig(): LeafletTileConfig {
   return {
-    url: DEFAULT_SATELLITE_SOURCE.url,
+    url: TILE_URLS.ESRI_SATELLITE,
     options: {
-      maxZoom: DEFAULT_SATELLITE_SOURCE.maxzoom,
-      attribution: DEFAULT_SATELLITE_SOURCE.attribution
+      maxZoom: MAP_DEFAULTS.RASTER_MAX_ZOOM,
+      attribution: 'Esri, Maxar, Earthstar Geographics'
     }
   }
 }

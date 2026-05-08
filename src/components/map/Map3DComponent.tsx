@@ -4,17 +4,7 @@ import { useEffect, useRef, useCallback, useState } from 'react'
 import maplibregl from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { formatDistance, formatDuration } from '@/services/routingService'
-import {
-  build3DMapStyle,
-  DEFAULT_MAP_CONFIG,
-  DEFAULT_3D_CAMERA,
-  KAMPALA_BOUNDS,
-  type MapStyleConfig,
-} from '@/lib/tile-sources'
-
-// ============================================
-// TYPES
-// ============================================
+import { build3DMapStyle, DEFAULT_MAP_CONFIG, DEFAULT_3D_CAMERA, KAMPALA_BOUNDS, type MapStyleConfig } from '@/lib/tile/sources'
 
 interface Delivery {
   id: number
@@ -36,11 +26,7 @@ interface Map3DComponentProps {
   onClose: () => void
 }
 
-// ============================================
-// MAIN COMPONENT
-// ============================================
-
-export default function Map3DComponent({
+export default function Map3DComponent({ 
   optimizedRoute = [],
   onClose
 }: Map3DComponentProps) {
@@ -49,14 +35,15 @@ export default function Map3DComponent({
   const markerRef = useRef<maplibregl.Marker | null>(null)
   const animationRef = useRef<number | null>(null)
   const initializedRef = useRef(false)
-
+  
   const [isNavigating, setIsNavigating] = useState(false)
   const [isPaused, setIsPaused] = useState(false)
   const [hasArrived, setHasArrived] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
+  const [mapError, setMapError] = useState<string | null>(null)
   const [showSpeedOptions, setShowSpeedOptions] = useState(false)
   const [speed, setSpeed] = useState(1)
-
+  
   const [totalDistance, setTotalDistance] = useState(0)
   const [totalDuration, setTotalDuration] = useState(0)
   const [remainingDistance, setRemainingDistance] = useState(0)
@@ -65,84 +52,44 @@ export default function Map3DComponent({
   const [currentRoad, setCurrentRoad] = useState('')
   const [progress, setProgress] = useState(0)
 
-  // NEW: Map style configuration state
-  const [mapConfig, setMapConfig] = useState<MapStyleConfig>(DEFAULT_MAP_CONFIG)
-  const [showSettings, setShowSettings] = useState(false)
-
   const warehouseLat = 0.3152
   const warehouseLng = 32.5814
 
-  // ============================================
-  // MAP STYLE UPDATE (when config changes)
-  // ============================================
+  // Map style config state
+  const [mapConfig, setMapConfig] = useState<MapStyleConfig>(DEFAULT_MAP_CONFIG)
 
-  const updateMapStyle = useCallback(() => {
-    const map = mapRef.current
-    if (!map || !map.isStyleLoaded()) return
-
-    // Rebuild and apply the style
-    const newStyle = build3DMapStyle(mapConfig)
-    map.setStyle(newStyle)
-
-    // Re-add route layer after style loads
-    map.once('style.load', () => {
-      if (routeCoords.length > 1) {
-        addRouteToMap(map)
-      }
-    })
-  }, [mapConfig, routeCoords])
-
-  // Update building opacity live without full style rebuild
-  useEffect(() => {
-    const map = mapRef.current
-    if (!map || !map.isStyleLoaded()) return
-    try {
-      if (map.getLayer('3d-buildings')) {
-        map.setPaintProperty('3d-buildings', 'fill-extrusion-opacity', mapConfig.showBuildings ? mapConfig.buildingOpacity : 0)
-      }
-    } catch {
-      // Layer may not exist yet
-    }
-  }, [mapConfig.buildingOpacity, mapConfig.showBuildings])
-
-  // ============================================
-  // INITIALIZE 3D MAP
-  // ============================================
-
+  // Initialize map with 3D buildings and true-color satellite
   useEffect(() => {
     if (!mapContainerRef.current || initializedRef.current) return
     initializedRef.current = true
 
+    // Build the complete 3D map style using the centralized builder
+    // Includes: ESRI World Imagery (true-color), OpenFreeMap 3D buildings,
+    // sky layer, light config, roads, water, and labels
     const mapStyle = build3DMapStyle(mapConfig)
 
     const map = new maplibregl.Map({
       container: mapContainerRef.current,
       style: mapStyle,
-      center: DEFAULT_3D_CAMERA.center,
+      center: [warehouseLng, warehouseLat],
       zoom: DEFAULT_3D_CAMERA.zoom,
       pitch: DEFAULT_3D_CAMERA.pitch,
       bearing: DEFAULT_3D_CAMERA.bearing,
       maxPitch: DEFAULT_3D_CAMERA.maxPitch,
       minZoom: DEFAULT_3D_CAMERA.minZoom,
-      maxZoom: DEFAULT_3D_CAMERA.maxZoom,
-      // NEW: Restrict to Kampala area
-      maxBounds: KAMPALA_BOUNDS,
+      maxZoom: DEFAULT_3D_CAMERA.maxZoom
     })
 
-    map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-right')
-    map.addControl(new maplibregl.ScaleControl({ maxWidth: 100, unit: 'metric' }), 'bottom-left')
-
-    // NEW: Add terrain control (for future elevation data)
-    // map.addControl(new maplibregl.TerrainControl({ source: 'terrain' }), 'top-right')
+    map.addControl(new maplibregl.NavigationControl(), 'top-right')
+    map.addControl(new maplibregl.ScaleControl(), 'bottom-left')
 
     map.on('load', () => {
       setIsLoading(false)
-      console.log('3D Map loaded — ESRI Satellite + OpenFreeMap Buildings + Sky')
+      setMapError(null)
     })
 
     map.on('error', (e) => {
-      console.warn('Map error (non-critical):', e)
-      setIsLoading(false)
+      console.error('Map error:', e)
     })
 
     mapRef.current = map
@@ -154,129 +101,9 @@ export default function Map3DComponent({
       mapRef.current = null
       initializedRef.current = false
     }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [])
 
-  // ============================================
-  // ADD ROUTE TO MAP (extracted for reuse)
-  // ============================================
-
-  const addRouteToMap = useCallback((map: maplibregl.Map) => {
-    try {
-      // Remove existing layers
-      if (map.getLayer('route-line')) map.removeLayer('route-line')
-      if (map.getLayer('route-outline')) map.removeLayer('route-outline')
-      if (map.getLayer('route-shadow')) map.removeLayer('route-shadow')
-      if (map.getSource('route')) map.removeSource('route')
-
-      // Add route source
-      map.addSource('route', {
-        type: 'geojson',
-        data: {
-          type: 'Feature',
-          properties: {},
-          geometry: { type: 'LineString', coordinates: routeCoords }
-        }
-      })
-
-      // NEW: Route shadow for depth effect
-      map.addLayer({
-        id: 'route-shadow',
-        type: 'line',
-        source: 'route',
-        layout: { 'line-join': 'round', 'line-cap': 'round' },
-        paint: {
-          'line-color': '#000000',
-          'line-width': 12,
-          'line-opacity': 0.2,
-          'line-blur': 6,
-        }
-      })
-
-      // Route outline (white casing)
-      map.addLayer({
-        id: 'route-outline',
-        type: 'line',
-        source: 'route',
-        layout: { 'line-join': 'round', 'line-cap': 'round' },
-        paint: { 'line-color': '#ffffff', 'line-width': 8, 'line-opacity': 0.8 }
-      })
-
-      // Route line (blue with gradient)
-      map.addLayer({
-        id: 'route-line',
-        type: 'line',
-        source: 'route',
-        layout: { 'line-join': 'round', 'line-cap': 'round' },
-        paint: {
-          'line-color': '#4285f4',
-          'line-width': 5,
-          // NEW: Gradient from green (start) to red (end)
-          'line-gradient': [
-            'interpolate', ['linear'], ['line-progress'],
-            0, '#34a853',    // Green — start
-            0.5, '#4285f4',  // Blue — midway
-            1, '#ea4335',    // Red — destination
-          ]
-        }
-      })
-
-      // Fit bounds with padding
-      const bounds = new maplibregl.LngLatBounds()
-      routeCoords.forEach(c => bounds.extend(c))
-      map.fitBounds(bounds, { padding: 100, pitch: 50, duration: 1500 })
-
-      // Add stop markers
-      optimizedRoute.forEach((stop) => {
-        const isLast = stop.order === optimizedRoute.length
-        const bgColor = isLast ? '#ea4335' : '#4285f4'
-        const el = document.createElement('div')
-        el.innerHTML = `
-          <div style="width:28px;height:28px;background:${bgColor};border:2px solid white;border-radius:50%;display:flex;align-items:center;justify-content:center;color:white;font-weight:bold;font-size:12px;box-shadow:0 2px 6px ${bgColor}66;">
-            ${stop.order}
-          </div>
-        `
-        new maplibregl.Marker({ element: el, anchor: 'center' })
-          .setLngLat([stop.delivery.lng, stop.delivery.lat])
-          .addTo(map)
-      })
-
-      // Add start marker
-      const startEl = document.createElement('div')
-      startEl.innerHTML = `
-        <div style="width:32px;height:32px;background:linear-gradient(135deg,#34a853,#0d9c38);border:2px solid white;border-radius:50%;display:flex;align-items:center;justify-content:center;color:white;font-weight:bold;font-size:14px;box-shadow:0 2px 6px rgba(52,168,83,0.5);">
-          S
-        </div>
-      `
-      new maplibregl.Marker({ element: startEl, anchor: 'center' })
-        .setLngLat([warehouseLng, warehouseLat])
-        .addTo(map)
-
-      // Navigation vehicle puck
-      const navEl = document.createElement('div')
-      navEl.innerHTML = `
-        <svg viewBox="0 0 44 44" width="44" height="44" style="filter:drop-shadow(0 2px 4px rgba(0,0,0,0.3))">
-          <circle cx="22" cy="22" r="18" fill="white" stroke="#4285f4" stroke-width="3"/>
-          <circle cx="22" cy="22" r="12" fill="#4285f4"/>
-          <polygon points="22,6 28,24 22,18 16,24" fill="white"/>
-        </svg>
-      `
-      markerRef.current = new maplibregl.Marker({
-        element: navEl,
-        anchor: 'center',
-        rotationAlignment: 'map',
-        pitchAlignment: 'map'
-      })
-        .setLngLat([warehouseLng, warehouseLat])
-        .addTo(map)
-    } catch (err) {
-      console.error('Error adding route:', err)
-    }
-  }, [routeCoords, optimizedRoute, warehouseLat, warehouseLng])
-
-  // ============================================
-  // CALCULATE AND DISPLAY ROUTE
-  // ============================================
-
+  // Calculate and display route
   useEffect(() => {
     const map = mapRef.current
     if (!map || optimizedRoute.length === 0) return
@@ -286,7 +113,7 @@ export default function Map3DComponent({
       ...optimizedRoute.map(stop => [stop.delivery.lng, stop.delivery.lat] as [number, number])
     ]
 
-    // Haversine distance calculation
+    // Calculate distance
     let totalDist = 0
     for (let i = 1; i < coords.length; i++) {
       const R = 6371000
@@ -304,22 +131,97 @@ export default function Map3DComponent({
     setRemainingDistance(totalDist)
     setRemainingDuration(totalDist / 15)
 
-    if (map.isStyleLoaded()) {
-      addRouteToMap(map)
-    } else {
-      map.on('load', () => addRouteToMap(map))
+    const addRouteLayer = () => {
+      try {
+        // Remove existing layers
+        if (map.getLayer('route-line')) map.removeLayer('route-line')
+        if (map.getLayer('route-outline')) map.removeLayer('route-outline')
+        if (map.getSource('route')) map.removeSource('route')
+
+        // Add route source
+        map.addSource('route', {
+          type: 'geojson',
+          data: {
+            type: 'Feature',
+            properties: {},
+            geometry: { type: 'LineString', coordinates: coords }
+          }
+        })
+
+        // Route outline
+        map.addLayer({
+          id: 'route-outline',
+          type: 'line',
+          source: 'route',
+          layout: { 'line-join': 'round', 'line-cap': 'round' },
+          paint: { 'line-color': '#ffffff', 'line-width': 8 }
+        })
+
+        // Route line
+        map.addLayer({
+          id: 'route-line',
+          type: 'line',
+          source: 'route',
+          layout: { 'line-join': 'round', 'line-cap': 'round' },
+          paint: { 'line-color': '#4285f4', 'line-width': 5 }
+        })
+
+        // Fit bounds
+        const bounds = new maplibregl.LngLatBounds()
+        coords.forEach(c => bounds.extend(c))
+        map.fitBounds(bounds, { padding: 100, pitch: 50, duration: 1500 })
+
+        // Add stop markers
+        optimizedRoute.forEach((stop) => {
+          const el = document.createElement('div')
+          el.innerHTML = `<div style="width:28px;height:28px;background:#4285f4;border:2px solid white;border-radius:50%;display:flex;align-items:center;justify-content:center;color:white;font-weight:bold;font-size:12px;box-shadow:0 2px 6px rgba(0,0,0,0.3)">${stop.order}</div>`
+          new maplibregl.Marker({ element: el, anchor: 'center' })
+            .setLngLat([stop.delivery.lng, stop.delivery.lat])
+            .addTo(map)
+        })
+
+        // Add start marker
+        const startEl = document.createElement('div')
+        startEl.innerHTML = `<div style="width:32px;height:32px;background:#10b981;border:2px solid white;border-radius:50%;display:flex;align-items:center;justify-content:center;color:white;font-weight:bold;font-size:14px;box-shadow:0 2px 6px rgba(0,0,0,0.3)">S</div>`
+        new maplibregl.Marker({ element: startEl, anchor: 'center' })
+          .setLngLat([warehouseLng, warehouseLat])
+          .addTo(map)
+
+        // Add navigation arrow marker
+        const navEl = document.createElement('div')
+        navEl.innerHTML = `
+          <svg viewBox="0 0 44 44" width="44" height="44" style="filter:drop-shadow(0 2px 4px rgba(0,0,0,0.3))">
+            <circle cx="22" cy="22" r="18" fill="white" stroke="#4285f4" stroke-width="3"/>
+            <circle cx="22" cy="22" r="12" fill="#4285f4"/>
+            <polygon points="22,6 28,24 22,18 16,24" fill="white"/>
+          </svg>
+        `
+        markerRef.current = new maplibregl.Marker({ 
+          element: navEl, 
+          anchor: 'center',
+          rotationAlignment: 'map',
+          pitchAlignment: 'map'
+        })
+          .setLngLat([warehouseLng, warehouseLat])
+          .addTo(map)
+      } catch (err) {
+        console.error('Error adding route:', err)
+      }
     }
-  }, [optimizedRoute, addRouteToMap])
 
-  // ============================================
-  // NAVIGATION ANIMATION
-  // ============================================
+    if (map.isStyleLoaded()) {
+      addRouteLayer()
+    } else {
+      map.on('load', addRouteLayer)
+    }
+  }, [optimizedRoute])
 
+  // Navigation
   const startNavigation = useCallback(() => {
     if (routeCoords.length < 2 || !mapRef.current || !markerRef.current) return
 
     setIsNavigating(true)
-
+    
     let currentIndex = 0
     const totalPoints = routeCoords.length
     let lastTime = performance.now()
@@ -349,10 +251,12 @@ export default function Map3DComponent({
 
       if (markerRef.current && mapRef.current) {
         markerRef.current.setLngLat(coord)
-
+        
+        // Calculate bearing for direction
         const bearing = Math.atan2(nextCoord[0] - coord[0], nextCoord[1] - coord[1]) * 180 / Math.PI
         markerRef.current.setRotation(bearing)
 
+        // Follow with 3D view
         mapRef.current.easeTo({
           center: coord,
           bearing: bearing,
@@ -382,44 +286,36 @@ export default function Map3DComponent({
 
   const togglePause = useCallback(() => setIsPaused(p => !p), [])
 
-  // ============================================
-  // RENDER
-  // ============================================
-
   return (
     <div className="fixed inset-0 z-[100] bg-gray-100">
       {/* Map */}
       <div ref={mapContainerRef} className="absolute inset-0" />
 
-      {/* Loading Overlay */}
+      {/* Loading */}
       {isLoading && (
-        <div className="absolute inset-0 bg-white/90 flex items-center justify-center z-10">
+        <div className="absolute inset-0 bg-white/90 flex items-center justify-center">
           <div className="text-center">
-            <div className="w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-4" />
-            <p className="text-gray-700 font-medium text-lg">Loading 3D Map</p>
-            <p className="text-gray-400 text-sm mt-1">ESRI Satellite + OpenFreeMap Buildings</p>
-            <div className="flex items-center justify-center gap-2 mt-3">
-              <div className="w-2 h-2 rounded-full bg-blue-400 animate-pulse" />
-              <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse [animation-delay:0.2s]" />
-              <div className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse [animation-delay:0.4s]" />
-            </div>
+            <div className="w-10 h-10 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-3"/>
+            <p className="text-gray-600">Loading 3D map...</p>
           </div>
         </div>
       )}
 
-      {/* Arrived Modal */}
+      {/* Error notice */}
+      {mapError && !isLoading && (
+        <div className="absolute top-16 left-4 right-4 bg-amber-100 text-amber-800 px-3 py-2 rounded-lg text-sm">
+          {mapError}
+        </div>
+      )}
+
+      {/* Arrived */}
       {hasArrived && (
-        <div className="absolute inset-0 bg-black/50 flex items-center justify-center z-30">
-          <div className="bg-white rounded-2xl p-8 text-center mx-4 max-w-sm">
-            <div className="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
-              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#34a853" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/>
-                <circle cx="12" cy="10" r="3"/>
-              </svg>
-            </div>
-            <h2 className="text-2xl font-bold text-gray-900 mb-2">Arrived!</h2>
-            <p className="text-gray-500 mb-6">{optimizedRoute[optimizedRoute.length - 1]?.delivery.shopName}</p>
-            <button onClick={onClose} className="w-full px-6 py-3 bg-blue-500 text-white rounded-xl font-semibold hover:bg-blue-600 transition-colors">
+        <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
+          <div className="bg-white rounded-2xl p-6 text-center mx-4">
+            <div className="text-5xl mb-3">🎉</div>
+            <h2 className="text-xl font-bold mb-2">Arrived!</h2>
+            <p className="text-gray-500 mb-4">{optimizedRoute[optimizedRoute.length - 1]?.delivery.shopName}</p>
+            <button onClick={onClose} className="px-5 py-2 bg-blue-500 text-white rounded-xl font-medium">
               Done
             </button>
           </div>
@@ -427,10 +323,10 @@ export default function Map3DComponent({
       )}
 
       {/* Top Bar */}
-      <div className="absolute top-4 left-4 right-4 flex items-center justify-between pointer-events-none z-20">
+      <div className="absolute top-4 left-4 right-4 flex items-center justify-between pointer-events-none">
         <button
           onClick={isNavigating ? stopNavigation : onClose}
-          className="w-10 h-10 bg-white rounded-full shadow-lg flex items-center justify-center pointer-events-auto hover:bg-gray-50 transition-colors"
+          className="w-10 h-10 bg-white rounded-full shadow-lg flex items-center justify-center pointer-events-auto"
         >
           {isNavigating ? (
             <svg width="20" height="20" viewBox="0 0 24 24" fill="#ef4444">
@@ -443,147 +339,31 @@ export default function Map3DComponent({
           )}
         </button>
 
-        <div className="flex items-center gap-2">
-          {/* NEW: Settings button */}
-          {!isNavigating && (
-            <button
-              onClick={() => setShowSettings(!showSettings)}
-              className={`px-3 py-2 bg-white rounded-lg shadow-lg text-xs font-medium flex items-center gap-1.5 pointer-events-auto transition-colors ${
-                showSettings ? 'bg-blue-500 text-white' : 'hover:bg-gray-50 text-gray-700'
-              }`}
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M12 2L4.5 20.29l.71.71L12 18l6.79 3 .71-.71z"/>
-              </svg>
-              3D
-            </button>
-          )}
+        {isNavigating && (
+          <div className="px-3 py-1.5 bg-green-500 text-white rounded-full text-sm font-medium flex items-center gap-1.5 pointer-events-auto">
+            <span className="w-1.5 h-1.5 bg-white rounded-full animate-pulse"/>
+            {isPaused ? 'Paused' : 'Navigating'}
+          </div>
+        )}
 
-          {isNavigating && (
-            <div className="px-3 py-1.5 bg-green-500 text-white rounded-full text-sm font-medium flex items-center gap-1.5 pointer-events-auto">
-              <span className="w-1.5 h-1.5 bg-white rounded-full animate-pulse"/>
-              {isPaused ? 'Paused' : 'Navigating'}
-            </div>
-          )}
-
-          {isNavigating && (
-            <button
-              onClick={() => setShowSpeedOptions(!showSpeedOptions)}
-              className="w-10 h-10 bg-white rounded-full shadow-lg flex items-center justify-center text-sm font-bold text-blue-600 pointer-events-auto"
-            >
-              {speed}x
-            </button>
-          )}
-        </div>
+        {isNavigating && (
+          <button
+            onClick={() => setShowSpeedOptions(!showSpeedOptions)}
+            className="w-10 h-10 bg-white rounded-full shadow-lg flex items-center justify-center text-sm font-bold text-blue-600 pointer-events-auto"
+          >
+            {speed}x
+          </button>
+        )}
       </div>
-
-      {/* NEW: 3D Settings Panel */}
-      {showSettings && !isNavigating && (
-        <div className="absolute top-16 right-4 w-72 bg-white/95 backdrop-blur-md rounded-xl shadow-xl z-20 p-4">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="font-semibold text-gray-900 text-sm">3D Map Settings</h3>
-            <button onClick={() => setShowSettings(false)} className="text-gray-400 hover:text-gray-600">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-              </svg>
-            </button>
-          </div>
-
-          {/* Building Height Exaggeration */}
-          <div className="mb-3">
-            <div className="flex items-center justify-between mb-1">
-              <span className="text-xs text-gray-600">Building Height</span>
-              <span className="text-xs font-medium text-gray-900">{mapConfig.buildingHeightExaggeration.toFixed(1)}x</span>
-            </div>
-            <input
-              type="range"
-              min="0.5"
-              max="3"
-              step="0.1"
-              value={mapConfig.buildingHeightExaggeration}
-              onChange={(e) => setMapConfig(c => ({ ...c, buildingHeightExaggeration: parseFloat(e.target.value) }))}
-              className="w-full h-1.5 rounded-full appearance-none bg-gray-200 accent-blue-500"
-            />
-          </div>
-
-          {/* Building Opacity */}
-          <div className="mb-3">
-            <div className="flex items-center justify-between mb-1">
-              <span className="text-xs text-gray-600">Building Opacity</span>
-              <span className="text-xs font-medium text-gray-900">{Math.round(mapConfig.buildingOpacity * 100)}%</span>
-            </div>
-            <input
-              type="range"
-              min="0.1"
-              max="1"
-              step="0.05"
-              value={mapConfig.buildingOpacity}
-              onChange={(e) => setMapConfig(c => ({ ...c, buildingOpacity: parseFloat(e.target.value) }))}
-              className="w-full h-1.5 rounded-full appearance-none bg-gray-200 accent-blue-500"
-            />
-          </div>
-
-          {/* Toggles */}
-          <div className="space-y-2 mb-3">
-            {[
-              { key: 'showBuildings' as const, label: '3D Buildings', color: 'blue' },
-              { key: 'showRoads' as const, label: 'Roads', color: 'yellow' },
-              { key: 'showWater' as const, label: 'Water', color: 'cyan' },
-              { key: 'showLabels' as const, label: 'Labels', color: 'gray' },
-              { key: 'showSky' as const, label: 'Sky', color: 'sky' },
-            ].map(toggle => (
-              <div key={toggle.key} className="flex items-center justify-between">
-                <span className="text-xs text-gray-600">{toggle.label}</span>
-                <button
-                  onClick={() => setMapConfig(c => ({ ...c, [toggle.key]: !c[toggle.key] }))}
-                  className={`w-9 h-5 rounded-full transition-all ${mapConfig[toggle.key] ? 'bg-blue-500' : 'bg-gray-300'}`}
-                >
-                  <div className={`w-3.5 h-3.5 rounded-full bg-white shadow-sm transition-transform ${mapConfig[toggle.key] ? 'translate-x-4.5' : 'translate-x-0.5'}`} />
-                </button>
-              </div>
-            ))}
-          </div>
-
-          {/* Day/Night Toggle */}
-          <button
-            onClick={() => setMapConfig(c => ({ ...c, nightMode: !c.nightMode }))}
-            className={`w-full py-2 rounded-lg text-xs font-medium flex items-center justify-center gap-2 transition-colors ${
-              mapConfig.nightMode
-                ? 'bg-yellow-500 text-black hover:bg-yellow-400'
-                : 'bg-gray-800 text-white hover:bg-gray-700'
-            }`}
-          >
-            {mapConfig.nightMode ? (
-              <>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
-                Switch to Day
-              </>
-            ) : (
-              <>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-                Switch to Night
-              </>
-            )}
-          </button>
-
-          {/* Apply Button */}
-          <button
-            onClick={updateMapStyle}
-            className="w-full mt-3 py-2 bg-blue-500 text-white rounded-lg text-xs font-medium hover:bg-blue-600 transition-colors"
-          >
-            Apply Changes
-          </button>
-        </div>
-      )}
 
       {/* Speed Menu */}
       {showSpeedOptions && (
-        <div className="absolute right-4 top-16 bg-white rounded-lg shadow-lg overflow-hidden z-20">
-          {[1, 2, 4, 8].map(s => (
+        <div className="absolute right-4 top-16 bg-white rounded-lg shadow-lg overflow-hidden z-10">
+          {[1, 2, 4].map(s => (
             <button
               key={s}
               onClick={() => { setSpeed(s); setShowSpeedOptions(false) }}
-              className={`w-full px-4 py-2 text-left text-sm ${speed === s ? 'bg-blue-50 text-blue-600 font-medium' : 'hover:bg-gray-50'}`}
+              className={`w-full px-4 py-2 text-left text-sm ${speed === s ? 'bg-blue-50 text-blue-600 font-medium' : ''}`}
             >
               {s}x Speed
             </button>
@@ -593,22 +373,22 @@ export default function Map3DComponent({
 
       {/* Road Name */}
       {isNavigating && currentRoad && (
-        <div className="absolute top-16 left-1/2 -translate-x-1/2 z-20">
-          <div className="px-4 py-1.5 bg-black/80 text-white rounded-full text-sm font-medium backdrop-blur-md">
+        <div className="absolute top-16 left-1/2 -translate-x-1/2">
+          <div className="px-3 py-1 bg-black/80 text-white rounded-full text-sm">
             {currentRoad}
           </div>
         </div>
       )}
 
       {/* Bottom Panel */}
-      {!isLoading && routeCoords.length > 1 && !hasArrive && (
-        <div className="absolute bottom-0 left-0 right-0 z-20">
+      {!isLoading && routeCoords.length > 1 && !hasArrived && (
+        <div className="absolute bottom-0 left-0 right-0">
           <div className="bg-white rounded-t-2xl shadow-lg">
             {isNavigating ? (
               <>
                 <div className="bg-blue-600 text-white p-4">
                   <div className="flex items-center gap-3">
-                    <div className="w-12 h-12 bg-white/20 rounded-lg flex items-center justify-center text-2xl">&#11014;</div>
+                    <div className="w-12 h-12 bg-white/20 rounded-lg flex items-center justify-center text-2xl">⬆</div>
                     <div>
                       <div className="text-2xl font-bold">{formatDistance(remainingDistance)}</div>
                       <div className="text-white/80 text-sm">Continue on route</div>
@@ -617,7 +397,7 @@ export default function Map3DComponent({
                 </div>
 
                 <div className="h-1 bg-gray-200">
-                  <div className="h-full bg-gradient-to-r from-green-500 via-blue-500 to-red-500 transition-all duration-300" style={{ width: `${Math.min((progress / Math.max(routeCoords.length - 1, 1)) * 100, 100)}%` }} />
+                  <div className="h-full bg-blue-500" style={{ width: `${Math.min((progress / Math.max(routeCoords.length - 1, 1)) * 100, 100)}%` }} />
                 </div>
 
                 <div className="flex items-center justify-between p-3">
@@ -645,11 +425,11 @@ export default function Map3DComponent({
                 <div className="p-4">
                   <div className="mb-3">
                     <div className="text-xl font-bold">{formatDistance(totalDistance)}</div>
-                    <div className="text-gray-500 text-sm">{formatDuration(totalDuration)} &bull; {optimizedRoute.length} stops</div>
+                    <div className="text-gray-500 text-sm">{formatDuration(totalDuration)} • {optimizedRoute.length} stops</div>
                   </div>
                   <button
                     onClick={startNavigation}
-                    className="w-full py-3 bg-blue-500 text-white rounded-xl font-bold flex items-center justify-center gap-2 hover:bg-blue-600 transition-colors"
+                    className="w-full py-3 bg-blue-500 text-white rounded-xl font-bold flex items-center justify-center gap-2"
                   >
                     <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21"/></svg>
                     Start 3D Navigation
@@ -678,16 +458,6 @@ export default function Map3DComponent({
 
       <style jsx global>{`
         .maplibregl-ctrl-attribution { display: none; }
-        input[type="range"]::-webkit-slider-thumb {
-          -webkit-appearance: none;
-          width: 14px;
-          height: 14px;
-          border-radius: 50%;
-          background: #3b82f6;
-          cursor: pointer;
-          border: 2px solid white;
-          box-shadow: 0 1px 3px rgba(0,0,0,0.2);
-        }
       `}</style>
     </div>
   )

@@ -724,7 +724,7 @@ export default function Navigation3DComponent({
               console.log('[Navigation3D] Added ' + osmBuildings.features.length + ' OSM buildings')
             }
           } catch (err) {
-            console.warn('[Navigation3D] OSM buildings supplement failed (non-critical):', err)
+            console.error('[Navigation3D] OSM buildings supplement failed:', err)
           }
 
           // Build route coordinates
@@ -902,15 +902,27 @@ export default function Navigation3DComponent({
               if (osmBuildings && osmBuildings.features.length > 0 && map.getSource('osm-buildings')) {
                 (map.getSource('osm-buildings') as maplibregl.GeoJSONSource).setData(osmBuildings as any)
               }
-            } catch {
-              // Non-critical
+            } catch (err) {
+              console.error('[Navigation3D] OSM buildings reload failed:', err)
             }
           }, 2000)
         })
 
-        // Handle map errors
+        // Handle map errors — FAIL explicitly, don't silently swallow errors
+        let tileErrorCount = 0
         map.on('error', (e) => {
-          console.warn('Map error (non-critical):', e)
+          const error = e.error
+          // Detect satellite tile loading failures
+          if (error && typeof error === 'object' && 'status' in error) {
+            tileErrorCount++
+            console.error(`[Navigation3D] Tile load error (${tileErrorCount}):`, error)
+            // If multiple tile errors occur, satellite tiles are likely broken
+            if (tileErrorCount >= 5 && mounted) {
+              setLoadError('Satellite tiles failed to load. Check your network connection and refresh.')
+            }
+          } else {
+            console.error('[Navigation3D] Map error:', error)
+          }
         })
 
         mapRef.current = map

@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import maplibregl from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
-import { build3DMapStyle, DEFAULT_MAP_CONFIG, NAVIGATION_CAMERA, KAMPALA_CENTER, type MapStyleConfig } from '@/lib/tile/sources'
+import { build3DMapStyle, DEFAULT_MAP_CONFIG, NAVIGATION_CAMERA, KAMPALA_CENTER, fetchOSMBuildings, addOSMBuildingLayer, type MapStyleConfig } from '@/lib/tile/sources'
 import { getTileEnhancer, type AIQualityLevel, type AIEnhancementMode } from '@/lib/ai-tile-enhancer'
 
 // ============================================
@@ -627,17 +627,18 @@ export default function Navigation3DComponent({
         // sky layer, light config, roads, water, and labels
         const mapStyle = build3DMapStyle({
           nightMode,
-          buildingHeightExaggeration: 1.0,
+          buildingHeightExaggeration: 2.0,        // FIXED: was 1.0, now 2.0 for Kampala sparse height data
           showBuildings: true,
           showRoads: true,
           showWater: true,
           showLabels: true,
           showSatellite: true,
           showSky: true,
-          buildingOpacity: 0.75,
+          buildingOpacity: 0.88,                   // FIXED: was 0.75, now 0.88 for better visibility
           satelliteOpacity: 1.0,
           roadOpacity: 0.85,
-          labelOpacity: nightMode ? 0.8 : 0.7
+          labelOpacity: nightMode ? 0.8 : 0.7,
+          satelliteSource: 'google' as const,      // FIXED: NEW — Google satellite = true-color for Kampala
         })
 
         // ============================================
@@ -704,6 +705,27 @@ export default function Navigation3DComponent({
           setIsLoading(false)
           setLoadError(null)
           isMapReadyRef.current = true
+
+          // FIXED: Load OSM Overpass buildings as supplement for Kampala
+          try {
+            const bounds = map.getBounds()
+            const osmBuildings = await fetchOSMBuildings({
+              south: bounds.getSouth(),
+              west: bounds.getWest(),
+              north: bounds.getNorth(),
+              east: bounds.getEast(),
+            })
+            if (osmBuildings && osmBuildings.features.length > 0) {
+              addOSMBuildingLayer(map, osmBuildings, {
+                nightMode,
+                buildingHeightExaggeration: 2.0,
+                buildingOpacity: 0.88,
+              })
+              console.log('[Navigation3D] Added ' + osmBuildings.features.length + ' OSM buildings')
+            }
+          } catch (err) {
+            console.warn('[Navigation3D] OSM buildings supplement failed (non-critical):', err)
+          }
 
           // Build route coordinates
           const coords: [number, number][] = [[warehouseLng, warehouseLat]]
@@ -862,6 +884,28 @@ export default function Navigation3DComponent({
             roadCoords.forEach(coord => bounds.extend(coord as [number, number]))
             map.fitBounds(bounds, { padding: 100, pitch: 60, duration: 1500 })
           }
+        })
+
+        // Reload OSM buildings when view changes significantly
+        let osmReloadTimeout: NodeJS.Timeout | null = null
+        map.on('moveend', () => {
+          if (osmReloadTimeout) clearTimeout(osmReloadTimeout)
+          osmReloadTimeout = setTimeout(async () => {
+            try {
+              const bounds = map.getBounds()
+              const osmBuildings = await fetchOSMBuildings({
+                south: bounds.getSouth(),
+                west: bounds.getWest(),
+                north: bounds.getNorth(),
+                east: bounds.getEast(),
+              })
+              if (osmBuildings && osmBuildings.features.length > 0 && map.getSource('osm-buildings')) {
+                (map.getSource('osm-buildings') as maplibregl.GeoJSONSource).setData(osmBuildings as any)
+              }
+            } catch {
+              // Non-critical
+            }
+          }, 2000)
         })
 
         // Handle map errors

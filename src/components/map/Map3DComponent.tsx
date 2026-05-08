@@ -4,7 +4,15 @@ import { useEffect, useRef, useCallback, useState } from 'react'
 import maplibregl from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { formatDistance, formatDuration } from '@/services/routingService'
-import { build3DMapStyle, DEFAULT_MAP_CONFIG, DEFAULT_3D_CAMERA, KAMPALA_BOUNDS, type MapStyleConfig } from '@/lib/tile/sources'
+import {
+  build3DMapStyle,
+  DEFAULT_MAP_CONFIG,
+  DEFAULT_3D_CAMERA,
+  KAMPALA_BOUNDS,
+  fetchOSMBuildings,
+  addOSMBuildingLayer,
+  type MapStyleConfig
+} from '@/lib/tile/sources'
 
 interface Delivery {
   id: number
@@ -26,7 +34,7 @@ interface Map3DComponentProps {
   onClose: () => void
 }
 
-export default function Map3DComponent({ 
+export default function Map3DComponent({
   optimizedRoute = [],
   onClose
 }: Map3DComponentProps) {
@@ -35,7 +43,7 @@ export default function Map3DComponent({
   const markerRef = useRef<maplibregl.Marker | null>(null)
   const animationRef = useRef<number | null>(null)
   const initializedRef = useRef(false)
-  
+
   const [isNavigating, setIsNavigating] = useState(false)
   const [isPaused, setIsPaused] = useState(false)
   const [hasArrived, setHasArrived] = useState(false)
@@ -43,7 +51,7 @@ export default function Map3DComponent({
   const [mapError, setMapError] = useState<string | null>(null)
   const [showSpeedOptions, setShowSpeedOptions] = useState(false)
   const [speed, setSpeed] = useState(1)
-  
+
   const [totalDistance, setTotalDistance] = useState(0)
   const [totalDuration, setTotalDuration] = useState(0)
   const [remainingDistance, setRemainingDistance] = useState(0)
@@ -51,21 +59,25 @@ export default function Map3DComponent({
   const [routeCoords, setRouteCoords] = useState<[number, number][]>([])
   const [currentRoad, setCurrentRoad] = useState('')
   const [progress, setProgress] = useState(0)
+  const [buildingCount, setBuildingCount] = useState(0)
 
   const warehouseLat = 0.3152
   const warehouseLng = 32.5814
 
-  // Map style config state
-  const [mapConfig, setMapConfig] = useState<MapStyleConfig>(DEFAULT_MAP_CONFIG)
+  // Map style config state — FIXED: uses Google satellite by default
+  const [mapConfig, setMapConfig] = useState<MapStyleConfig>({
+    ...DEFAULT_MAP_CONFIG,
+    satelliteSource: 'google',       // FIXED: Google = true-color
+    buildingHeightExaggeration: 2.0, // FIXED: 2x height for Kampala sparse data
+  })
 
-  // Initialize map with 3D buildings and true-color satellite
+  // Initialize map with 3D buildings and TRUE-COLOR satellite
   useEffect(() => {
     if (!mapContainerRef.current || initializedRef.current) return
     initializedRef.current = true
 
     // Build the complete 3D map style using the centralized builder
-    // Includes: ESRI World Imagery (true-color), OpenFreeMap 3D buildings,
-    // sky layer, light config, roads, water, and labels
+    // FIXED: Google Satellite (true-color), vibrant building colors, 2x height
     const mapStyle = build3DMapStyle(mapConfig)
 
     const map = new maplibregl.Map({
@@ -83,19 +95,63 @@ export default function Map3DComponent({
     map.addControl(new maplibregl.NavigationControl(), 'top-right')
     map.addControl(new maplibregl.ScaleControl(), 'bottom-left')
 
-    map.on('load', () => {
+    map.on('load', async () => {
       setIsLoading(false)
       setMapError(null)
+
+      // FIXED: Load OSM Overpass buildings as a supplement
+      // This ensures buildings are visible even if OpenFreeMap tiles are sparse for Kampala
+      try {
+        const bounds = map.getBounds()
+        const osmBuildings = await fetchOSMBuildings({
+          south: bounds.getSouth(),
+          west: bounds.getWest(),
+          north: bounds.getNorth(),
+          east: bounds.getEast(),
+        })
+
+        if (osmBuildings && osmBuildings.features.length > 0) {
+          addOSMBuildingLayer(map, osmBuildings, mapConfig)
+          setBuildingCount(osmBuildings.features.length)
+          console.log(`[Map3D] Added ${osmBuildings.features.length} OSM buildings as supplement`)
+        }
+      } catch (err) {
+        console.warn('[Map3D] OSM buildings supplement failed (non-critical):', err)
+      }
     })
 
     map.on('error', (e) => {
       console.error('Map error:', e)
     })
 
+    // Reload OSM buildings when view changes significantly
+    let reloadTimeout: NodeJS.Timeout | null = null
+    map.on('moveend', () => {
+      if (reloadTimeout) clearTimeout(reloadTimeout)
+      reloadTimeout = setTimeout(async () => {
+        try {
+          const bounds = map.getBounds()
+          const osmBuildings = await fetchOSMBuildings({
+            south: bounds.getSouth(),
+            west: bounds.getWest(),
+            north: bounds.getNorth(),
+            east: bounds.getEast(),
+          })
+          if (osmBuildings && osmBuildings.features.length > 0 && map.getSource('osm-buildings')) {
+            (map.getSource('osm-buildings') as maplibregl.GeoJSONSource).setData(osmBuildings as any)
+            setBuildingCount(osmBuildings.features.length)
+          }
+        } catch {
+          // Non-critical, ignore
+        }
+      }, 2000)
+    })
+
     mapRef.current = map
 
     return () => {
       if (animationRef.current) cancelAnimationFrame(animationRef.current)
+      if (reloadTimeout) clearTimeout(reloadTimeout)
       markerRef.current?.remove()
       map.remove()
       mapRef.current = null
@@ -196,8 +252,8 @@ export default function Map3DComponent({
             <polygon points="22,6 28,24 22,18 16,24" fill="white"/>
           </svg>
         `
-        markerRef.current = new maplibregl.Marker({ 
-          element: navEl, 
+        markerRef.current = new maplibregl.Marker({
+          element: navEl,
           anchor: 'center',
           rotationAlignment: 'map',
           pitchAlignment: 'map'
@@ -221,7 +277,7 @@ export default function Map3DComponent({
     if (routeCoords.length < 2 || !mapRef.current || !markerRef.current) return
 
     setIsNavigating(true)
-    
+
     let currentIndex = 0
     const totalPoints = routeCoords.length
     let lastTime = performance.now()
@@ -251,7 +307,7 @@ export default function Map3DComponent({
 
       if (markerRef.current && mapRef.current) {
         markerRef.current.setLngLat(coord)
-        
+
         // Calculate bearing for direction
         const bearing = Math.atan2(nextCoord[0] - coord[0], nextCoord[1] - coord[1]) * 180 / Math.PI
         markerRef.current.setRotation(bearing)
@@ -297,7 +353,15 @@ export default function Map3DComponent({
           <div className="text-center">
             <div className="w-10 h-10 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-3"/>
             <p className="text-gray-600">Loading 3D map...</p>
+            <p className="text-gray-400 text-xs mt-1">Google Satellite + OpenFreeMap 3D Buildings</p>
           </div>
+        </div>
+      )}
+
+      {/* Building count indicator */}
+      {buildingCount > 0 && !isLoading && (
+        <div className="absolute top-4 right-16 bg-white/90 backdrop-blur-sm px-3 py-1.5 rounded-lg shadow text-xs text-gray-600 z-10">
+          {buildingCount} buildings loaded
         </div>
       )}
 

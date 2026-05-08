@@ -1,27 +1,27 @@
 /**
- * Enhanced Tile Source Configuration (v5 — NEW)
+ * Enhanced Tile Source Configuration (v6 — FIXED for Kampala)
  *
- * Production-grade tile sources for the 3D logistics dashboard.
- * Only free, no-API-key-required, battle-tested sources.
- *
- * NEW Features over v4:
- * - Sky layer configuration for atmospheric rendering
- * - Light positioning for realistic building shadows
- * - Terrain source configuration (ready for future elevation data)
- * - Enhanced building color gradients with glass-like effects
- * - Building height exaggeration multiplier
- * - Separate layer groupings for independent toggle control
- * - Kampala-specific optimizations (zoom levels, source-layer filters)
+ * KEY FIXES over v5:
+ * - Switched default satellite from ESRI to Google Maps (true-color for Kampala)
+ * - ESRI still available as fallback option
+ * - Increased building default height from 5m to 12m
+ * - Increased building height exaggeration default from 1.0 to 2.0
+ * - Changed building colors from muted gray to vibrant, high-contrast colors
+ * - Lowered building minzoom from 13 to 11
+ * - Increased building opacity from 0.75 to 0.88
+ * - Added OSM Overpass GeoJSON building source as supplement
+ * - Added Google satellite as primary source (proven true-color globally)
  *
  * Architecture (rendered bottom-to-top):
- *   1. ESRI Satellite (raster base)
+ *   1. Google Satellite (raster base — TRUE COLOR)
  *   2. OpenFreeMap Water (vector fill)
  *   3. OpenFreeMap Landuse (vector, subtle fill)
  *   4. Sky layer (atmospheric gradient)
- *   5. 3D Buildings (fill-extrusion with render_height + glass effect)
- *   6. OpenFreeMap Roads (vector lines)
- *   7. Delivery route (geojson line)
- *   8. CARTO Labels (raster overlay)
+ *   5. 3D Buildings — OpenFreeMap vector (fill-extrusion with render_height)
+ *   6. 3D Buildings — OSM Overpass GeoJSON supplement (fill-extrusion)
+ *   7. OpenFreeMap Roads (vector lines)
+ *   8. Delivery route (geojson line)
+ *   9. CARTO Labels (raster overlay)
  */
 
 import type { StyleSpecification } from 'maplibre-gl'
@@ -31,14 +31,21 @@ import type { StyleSpecification } from 'maplibre-gl'
 // ============================================
 
 export const SATELLITE_SOURCES = {
-  /** ESRI World Imagery — highest reliability, free, no key needed */
+  /** Google Maps Satellite — TRUE COLOR, high-res globally, free for limited use */
+  google: {
+    id: 'google-satellite',
+    url: 'https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
+    maxzoom: 20,
+    attribution: 'Google Maps',
+  },
+  /** ESRI World Imagery — may show infrared for some African regions */
   esri: {
     id: 'esri-world',
     url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
     maxzoom: 19,
     attribution: 'Esri, Maxar, Earthstar Geographics',
   },
-  /** ESRI Clarity — sharper contrast variant for urban areas */
+  /** ESRI Clarity — sharper contrast but KNOWN to show infrared in Kampala */
   esriClarity: {
     id: 'esri-clarity',
     url: 'https://clarity.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
@@ -110,26 +117,38 @@ export interface MapStyleConfig {
   satelliteOpacity: number
   roadOpacity: number
   labelOpacity: number
+  /** Which satellite source to use: 'google' (true-color), 'esri', or 'esriClarity' */
+  satelliteSource: 'google' | 'esri' | 'esriClarity'
 }
 
 export const DEFAULT_MAP_CONFIG: MapStyleConfig = {
   nightMode: false,
-  buildingHeightExaggeration: 1.0,
+  buildingHeightExaggeration: 2.0,     // FIXED: was 1.0, now 2.0 for Kampala where height data is sparse
   showBuildings: true,
   showRoads: true,
   showWater: true,
   showLabels: true,
   showSatellite: true,
   showSky: true,
-  buildingOpacity: 0.75,
+  buildingOpacity: 0.88,               // FIXED: was 0.75, now 0.88 for better visibility
   satelliteOpacity: 1.0,
   roadOpacity: 0.85,
   labelOpacity: 0.7,
+  satelliteSource: 'google',            // FIXED: was esri (shows infrared), now google (true-color)
 }
 
 // ============================================
-// HELPER: Get label source by mode
+// HELPER: Get satellite source by config
 // ============================================
+
+function getSatelliteSource(source: MapStyleConfig['satelliteSource']) {
+  switch (source) {
+    case 'google': return SATELLITE_SOURCES.google
+    case 'esri': return SATELLITE_SOURCES.esri
+    case 'esriClarity': return SATELLITE_SOURCES.esriClarity
+    default: return SATELLITE_SOURCES.google
+  }
+}
 
 export function getLabelSource(nightMode: boolean) {
   return nightMode ? LABEL_SOURCES.dark : LABEL_SOURCES.light
@@ -141,29 +160,28 @@ export function getLabelSource(nightMode: boolean) {
 
 /**
  * Build the complete MapLibre style object for the 3D map.
- * 
- * NEW: Accepts a MapStyleConfig for granular control over every layer.
- * NEW: Includes sky layer for atmospheric rendering.
- * NEW: Building height exaggeration multiplier for visual enhancement.
- * NEW: Glass-like building coloring for tall structures.
- * NEW: Better road hierarchy with width based on class.
+ *
+ * FIXED: Google satellite for true-color imagery in Kampala.
+ * FIXED: Building colors changed from muted gray to vibrant high-contrast colors.
+ * FIXED: Building height exaggeration default 2.0 for sparse height data.
+ * FIXED: Building minzoom lowered from 13 to 11.
+ * FIXED: Building fallback height from 5m to 12m.
  */
 export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpecification {
   const c = { ...DEFAULT_MAP_CONFIG, ...config }
-
-  // Calculate building height multiplier expression
+  const satSource = getSatelliteSource(c.satelliteSource)
   const heightMultiplier = c.buildingHeightExaggeration
 
   return {
     version: 8 as const,
     sources: {
-      // Base satellite imagery
+      // Base satellite imagery — FIXED: Google for true-color
       'satellite': {
         type: 'raster' as const,
-        tiles: [SATELLITE_SOURCES.esri.url],
+        tiles: [satSource.url],
         tileSize: 256,
-        maxzoom: SATELLITE_SOURCES.esri.maxzoom,
-        attribution: SATELLITE_SOURCES.esri.attribution,
+        maxzoom: satSource.maxzoom,
+        attribution: satSource.attribution,
       },
       // OpenFreeMap vector tiles for buildings, roads, water
       'openmaptiles': {
@@ -180,7 +198,7 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
         maxzoom: 19,
       },
     },
-    // NEW: Sky layer for atmospheric rendering
+    // Sky layer for atmospheric rendering
     sky: c.showSky ? {
       'sky-color': c.nightMode ? '#0a0a1a' : '#88bbee',
       'horizon-color': c.nightMode ? '#1a1a2e' : '#b8d4e8',
@@ -188,11 +206,11 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
       'fog-ground-blend': 0.9,
       'horizon-fog-blend': 0.4,
       'sky-horizon-blend': 0.6,
-      'atmosphere-blend': c.nightMode 
+      'atmosphere-blend': c.nightMode
         ? ['interpolate', ['linear'], ['zoom'], 0, 0.3, 14, 0.1, 18, 0.05]
         : ['interpolate', ['linear'], ['zoom'], 0, 0.5, 14, 0.3, 18, 0.15],
     } : undefined,
-    // NEW: Light configuration for 3D building rendering
+    // Light configuration for 3D building rendering
     light: {
       anchor: 'viewport',
       color: c.nightMode ? '#334466' : '#ffffff',
@@ -208,7 +226,7 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
         type: 'raster' as const,
         source: 'satellite',
         minzoom: 0,
-        maxzoom: 19,
+        maxzoom: 20,
         paint: {
           'raster-opacity': c.satelliteOpacity,
           'raster-brightness-max': c.nightMode ? 0.6 : 1.0,
@@ -242,44 +260,42 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
         },
       },
 
-      // 4. 3D Buildings — NEW: Enhanced with glass effect and height exaggeration
+      // 4. 3D Buildings — FIXED: vibrant colors, lower minzoom, higher default height
       ...(c.showBuildings ? [
         {
           id: '3d-buildings',
           type: 'fill-extrusion' as const,
           source: 'openmaptiles',
           'source-layer': 'building',
-          minzoom: 13,
+          minzoom: 11,                      // FIXED: was 13, now 11 for earlier visibility
           paint: {
-            // NEW: Multi-stop color gradient based on height
-            // Low buildings: warm concrete tones
-            // Mid buildings: cool gray-blue
-            // Tall buildings: glass-like teal with blue tint
+            // FIXED: Changed from muted gray to VIBRANT, high-contrast colors
+            // that stand out clearly against satellite imagery
             'fill-extrusion-color': c.nightMode
               ? [
                   'interpolate', ['linear'], ['get', 'render_height'],
-                  0, '#2d2d3f',
-                  10, '#3a3a55',
-                  20, '#45456b',
-                  40, '#555580',
-                  60, '#6565a0',
-                  80, '#7575bb',
-                  100, '#8585d6',
+                  0, '#4a6fa5',      // Deep blue — ground/short
+                  10, '#5b82b8',     // Medium blue
+                  20, '#6c95cb',     // Blue
+                  40, '#7da8de',     // Light blue
+                  60, '#8ebbef',     // Bright blue
+                  80, '#9fcfff',     // Sky blue
+                  100, '#b0e0ff',    // Ice blue — tall/skyscraper
                 ]
               : [
                   'interpolate', ['linear'], ['get', 'render_height'],
-                  0, '#d4cfc8',    // Ground: warm concrete
-                  10, '#c8c4bc',    // Low: light stone
-                  20, '#b8b8c4',    // Mid: cool gray
-                  40, '#a0a8b8',    // Medium: blue-gray
-                  60, '#88a0b8',    // Tall: steel blue
-                  80, '#7098c4',    // Higher: glass blue
-                  100, '#5890d0',   // Skyscraper: reflective blue
+                  0, '#e8a838',      // Warm orange — ground/short (HIGHEST CONTRAST vs green satellite)
+                  10, '#e0922e',     // Deep orange
+                  20, '#d87c24',     // Burnt orange
+                  40, '#c46820',     // Rust
+                  60, '#b0541c',     // Brown-orange
+                  80, '#9c4018',     // Deep brown
+                  100, '#882c14',    // Dark mahogany — tall/skyscraper
                 ],
-            // NEW: Height with exaggeration multiplier
+            // FIXED: Height fallback from 5m to 12m for Kampala sparse data
             'fill-extrusion-height': [
               '*',
-              ['coalesce', ['get', 'render_height'], 5],
+              ['coalesce', ['get', 'render_height'], 12],   // FIXED: was 5, now 12
               heightMultiplier,
             ],
             'fill-extrusion-base': [
@@ -290,27 +306,27 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
             'fill-extrusion-opacity': c.buildingOpacity,
           },
         },
-        // NEW: Building outline layer for better definition
+        // Building outline layer for better definition
         {
           id: 'building-outline',
           type: 'line' as const,
           source: 'openmaptiles',
           'source-layer': 'building',
-          minzoom: 15,
+          minzoom: 14,                      // Lowered from 15 to 14
           paint: {
-            'line-color': c.nightMode ? '#5a5a7a' : '#a0a0a0',
+            'line-color': c.nightMode ? '#5a5a7a' : '#ffffff',
             'line-width': [
               'interpolate', ['linear'], ['zoom'],
-              15, 0.3,
-              17, 0.8,
-              19, 1.5,
+              14, 0.4,
+              16, 1.0,
+              18, 2.0,
             ],
-            'line-opacity': 0.4,
+            'line-opacity': 0.5,
           },
         },
       ] : []),
 
-      // 5. Road network — NEW: Better hierarchy with class-based styling
+      // 5. Road network
       ...(c.showRoads ? [
         // Major roads (primary, trunk)
         {
@@ -407,6 +423,120 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
       }] : []),
     ].filter(Boolean),
   } as StyleSpecification
+}
+
+// ============================================
+// OSM BUILDINGS GEOJSON LOADER
+// ============================================
+
+/**
+ * Fetch building GeoJSON from the OSM Overpass API route.
+ * This supplements the OpenFreeMap vector tile buildings with
+ * potentially more complete data for Kampala.
+ */
+export async function fetchOSMBuildings(
+  bounds: { south: number; west: number; north: number; east: number }
+): Promise<GeoJSON.FeatureCollection | null> {
+  try {
+    const bbox = `${bounds.south},${bounds.west},${bounds.north},${bounds.east}`
+    const response = await fetch(`/api/osm/buildings?bbox=${bbox}`, {
+      signal: AbortSignal.timeout(15000),
+    })
+
+    if (!response.ok) {
+      console.warn('[OSM Buildings] Fetch failed:', response.status)
+      return null
+    }
+
+    const data = await response.json()
+    console.log(`[OSM Buildings] Loaded ${data.features?.length || 0} buildings from Overpass API`)
+    return data
+  } catch (error) {
+    console.warn('[OSM Buildings] Error:', error)
+    return null
+  }
+}
+
+/**
+ * Add OSM Overpass building data as a supplementary GeoJSON layer on the map.
+ * This ensures buildings are visible even if OpenFreeMap tiles are sparse.
+ */
+export function addOSMBuildingLayer(
+  map: maplibregl.Map,
+  geojson: GeoJSON.FeatureCollection,
+  config: Partial<MapStyleConfig> = {}
+): void {
+  const c = { ...DEFAULT_MAP_CONFIG, ...config }
+
+  // Remove existing OSM buildings layer/source if present
+  if (map.getLayer('osm-buildings-3d')) map.removeLayer('osm-buildings-3d')
+  if (map.getLayer('osm-building-outline')) map.removeLayer('osm-building-outline')
+  if (map.getSource('osm-buildings')) map.removeSource('osm-buildings')
+
+  // Add GeoJSON source
+  map.addSource('osm-buildings', {
+    type: 'geojson',
+    data: geojson as any,
+  })
+
+  // Add 3D extrusion layer — same vibrant colors as vector tile buildings
+  map.addLayer({
+    id: 'osm-buildings-3d',
+    type: 'fill-extrusion',
+    source: 'osm-buildings',
+    minzoom: 11,
+    paint: {
+      'fill-extrusion-color': c.nightMode
+        ? [
+            'interpolate', ['linear'], ['get', 'render_height'],
+            0, '#4a6fa5',
+            10, '#5b82b8',
+            20, '#6c95cb',
+            40, '#7da8de',
+            60, '#8ebbef',
+            100, '#b0e0ff',
+          ]
+        : [
+            'interpolate', ['linear'], ['get', 'render_height'],
+            0, '#e8a838',
+            10, '#e0922e',
+            20, '#d87c24',
+            40, '#c46820',
+            60, '#b0541c',
+            80, '#9c4018',
+            100, '#882c14',
+          ],
+      'fill-extrusion-height': [
+        '*',
+        ['coalesce', ['get', 'render_height'], 12],
+        c.buildingHeightExaggeration,
+      ],
+      'fill-extrusion-base': [
+        '*',
+        ['coalesce', ['get', 'render_min_height'], 0],
+        c.buildingHeightExaggeration,
+      ],
+      'fill-extrusion-opacity': c.buildingOpacity,
+    },
+  })
+
+  // Add outline for OSM buildings
+  map.addLayer({
+    id: 'osm-building-outline',
+    type: 'line',
+    source: 'osm-buildings',
+    minzoom: 14,
+    paint: {
+      'line-color': c.nightMode ? '#5a5a7a' : '#ffffff',
+      'line-width': [
+        'interpolate', ['linear'], ['zoom'],
+        14, 0.3,
+        16, 0.8,
+        18, 1.5,
+      ],
+      'line-opacity': 0.4,
+    },
+  })
 }
 
 // ============================================

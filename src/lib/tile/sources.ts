@@ -1,83 +1,79 @@
 /**
- * Enhanced Tile Source Configuration (v9 — ESRI World Imagery as default)
+ * Enhanced Tile Source Configuration (v10 — ALL TILES PROXIED)
  *
- * v9 FIXES over v8:
- * - Switched default satellite source to ESRI World Imagery (TRUE-COLOR, direct load)
- * - ESRI tiles have Access-Control-Allow-Origin: * headers, so they load
- *   DIRECTLY in the browser without needing a proxy server
- * - Google satellite REQUIRES proxy + DNS resolution of mt1.google.com,
- *   which is UNRELIABLE from Kampala networks (ENOTFOUND errors)
- * - ESRI World Imagery = true-color satellite imagery for Kampala
- *   (NOT to be confused with ESRI Clarity which shows infrared)
- * - crossOrigin:'anonymous' set on all raster sources for WebGL
+ * v10 FIXES over v9:
+ * - ALL external tiles routed through /api/tile/proxy
+ *   (browser can't reach external URLs from Kampala network)
+ * - ESRI satellite tiles through proxy
+ * - CARTO label tiles through proxy
+ * - Removed crossOrigin (not needed for same-origin proxy requests)
+ * - Browser ONLY talks to localhost:3000 (the Next.js server)
+ * - Server fetches external tiles and serves them locally
  *
- * Architecture (rendered bottom-to-top):
- *   1. ESRI World Imagery (raster base — TRUE COLOR, direct load, CORS)
- *   2. OpenFreeMap Water (vector fill)
- *   3. OpenFreeMap Landuse (vector, subtle fill)
- *   4. Sky layer (atmospheric gradient)
- *   5. 3D Buildings — OpenFreeMap vector (fill-extrusion with render_height)
- *   6. 3D Buildings — OSM Overpass GeoJSON supplement (fill-extrusion)
- *   7. OpenFreeMap Roads (vector lines)
- *   8. Delivery route (geojson line)
- *   9. CARTO Labels (raster overlay, direct load, CORS)
+ * Why proxy EVERYTHING:
+ * - Browser at localhost:3000 cannot reach external URLs
+ *   (AJAXError: Failed to fetch (0) for ESRI, CARTO, Google)
+ * - But the Next.js server CAN reach external services
+ *   (Google tiles returned 200 through proxy in earlier sessions)
+ * - Proxy runs on same machine = no network barrier
+ * - Proxy adds CORS headers + caching
+ *
+ * Architecture:
+ *   Browser → localhost:3000/api/tile/proxy → External tile servers
  */
 
 import type { StyleSpecification } from 'maplibre-gl'
 
 // ============================================
-// TILE SOURCE DEFINITIONS
+// PROXIED TILE URL BUILDERS
 // ============================================
+// All external tile URLs go through /api/tile/proxy so the browser
+// never makes direct requests to external servers.
+//
+// URL construction:
+//   1. Encode the base URL (everything before {z}/{x}/{y})
+//   2. Keep {z},{x},{y} as unencoded literals for MapLibre substitution
+//   3. After substitution, server decodes the url param and fetches
 
-/**
- * ESRI World Imagery — TRUE COLOR satellite tiles.
- *
- * WHY ESRI, not Google:
- * - ESRI ArcGIS Online returns Access-Control-Allow-Origin: * headers
- *   so tiles load DIRECTLY in the browser (no proxy needed, no timeouts)
- * - Google satellite (mt1.google.com) requires a server-side proxy,
- *   but DNS resolution of mt1.google.com is UNRELIABLE from Kampala
- *   networks, causing ENOTFOUND errors and tile proxy timeouts
- * - ESRI World Imagery is TRUE COLOR in Kampala (RGB satellite photos)
- * - NOT the same as ESRI Clarity which shows infrared/false-color
- *
- * Tile URL: https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}
- * CORS: Access-Control-Allow-Origin: * (verified)
- * Max zoom: 19
- */
-const ESRI_WORLD_IMAGERY = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
+// --- ESRI World Imagery (TRUE COLOR satellite) ---
+// Verified: server.arcgisonline.com has Access-Control-Allow-Origin: *
+// Direct browser access fails from Kampala networks → must proxy
+const ESRI_BASE = encodeURIComponent('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile')
+const ESRI_PROXIED = `/api/tile/proxy?url=${ESRI_BASE}%2F{z}%2F{y}%2F{x}`
 
-/**
- * Google satellite tile URL template (requires proxy).
- *
- * WARNING: mt1.google.com DNS resolution is UNRELIABLE from Kampala.
- * Only use if your network can resolve Google hostnames.
- * Requires /api/tile/proxy for CORS bypass.
- */
+// --- Google Satellite (TRUE COLOR, needs proxy for CORS bypass) ---
 const GOOGLE_SATELLITE_BASE = encodeURIComponent('https://mt1.google.com/vt/lyrs=s')
 const GOOGLE_SATELLITE_PROXIED = `/api/tile/proxy?url=${GOOGLE_SATELLITE_BASE}%26x%3D{x}%26y%3D{y}%26z%3D{z}`
 
+// --- CARTO Labels (both light and dark) ---
+const CARTO_LIGHT_BASE = encodeURIComponent('https://a.basemaps.cartocdn.com/light_only_labels')
+const CARTO_DARK_BASE = encodeURIComponent('https://a.basemaps.cartocdn.com/dark_only_labels')
+const CARTO_LIGHT_PROXIED = `/api/tile/proxy?url=${CARTO_LIGHT_BASE}%2F{z}%2F{x}%2F{y}%402x.png`
+const CARTO_DARK_PROXIED = `/api/tile/proxy?url=${CARTO_DARK_BASE}%2F{z}%2F{x}%2F{y}%402x.png`
+
+// ============================================
+// TILE SOURCE DEFINITIONS
+// ============================================
+
 export const SATELLITE_SOURCES = {
-  /** ESRI World Imagery — TRUE COLOR satellite, direct load with CORS (RECOMMENDED for Kampala) */
+  /** ESRI World Imagery — TRUE COLOR satellite, proxied */
   esri: {
     id: 'esri-world',
-    url: ESRI_WORLD_IMAGERY,
+    url: ESRI_PROXIED,
     maxzoom: 19,
     attribution: 'Esri, Maxar, Earthstar Geographics',
-    requiresProxy: false, // ESRI has CORS headers — loads directly
   },
-  /** Google Maps Satellite — TRUE COLOR but requires proxy + DNS resolution of mt1.google.com */
+  /** Google Maps Satellite — TRUE COLOR but DNS may fail from Kampala */
   google: {
     id: 'google-satellite',
     url: GOOGLE_SATELLITE_PROXIED,
     maxzoom: 20,
     attribution: 'Google Maps',
-    requiresProxy: true, // Google blocks direct browser access — needs proxy
   },
 } as const
 
 export const VECTOR_SOURCES = {
-  /** OpenFreeMap planet vector tiles — buildings with render_height, roads, water, landuse */
+  /** OpenFreeMap planet vector tiles — buildings, roads, water, landuse */
   openfreemap: {
     id: 'openfreemap',
     url: 'https://tiles.openfreemap.org/planet/{z}/{x}/{y}.pbf',
@@ -89,13 +85,13 @@ export const VECTOR_SOURCES = {
 export const LABEL_SOURCES = {
   light: {
     id: 'carto-light-labels',
-    url: 'https://a.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}@2x.png',
+    url: CARTO_LIGHT_PROXIED,
     maxzoom: 19,
     attribution: 'CARTO',
   },
   dark: {
     id: 'carto-dark-labels',
-    url: 'https://a.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}@2x.png',
+    url: CARTO_DARK_PROXIED,
     maxzoom: 19,
     attribution: 'CARTO',
   },
@@ -139,7 +135,7 @@ export interface MapStyleConfig {
   satelliteOpacity: number
   roadOpacity: number
   labelOpacity: number
-  /** Which satellite source: 'esri' (recommended, direct CORS) or 'google' (needs proxy) */
+  /** Which satellite source: 'esri' (recommended) or 'google' (DNS may fail) */
   satelliteSource: 'esri' | 'google'
 }
 
@@ -156,7 +152,7 @@ export const DEFAULT_MAP_CONFIG: MapStyleConfig = {
   satelliteOpacity: 1.0,
   roadOpacity: 0.85,
   labelOpacity: 0.7,
-  satelliteSource: 'esri',  // v9: ESRI World Imagery — reliable from Kampala, direct CORS
+  satelliteSource: 'esri',  // ESRI World Imagery — true-color, proxied
 }
 
 // ============================================
@@ -179,12 +175,6 @@ export function getLabelSource(nightMode: boolean) {
 // ENHANCED MAPLIBRE STYLE BUILDER
 // ============================================
 
-/**
- * Build the complete MapLibre style object for the 3D map.
- *
- * v9: ESRI World Imagery as default — loads directly with CORS, no proxy.
- * crossOrigin:'anonymous' set on all raster sources for WebGL compatibility.
- */
 export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpecification {
   const c = { ...DEFAULT_MAP_CONFIG, ...config }
   const satSource = getSatelliteSource(c.satelliteSource)
@@ -193,17 +183,14 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
   return {
     version: 8 as const,
     sources: {
-      // Base satellite imagery — ESRI World Imagery (direct, CORS) or Google (proxied)
+      // Satellite imagery — proxied through /api/tile/proxy
       'satellite': {
         type: 'raster' as const,
         tiles: [satSource.url],
         tileSize: 256,
         maxzoom: satSource.maxzoom,
         attribution: satSource.attribution,
-        // crossOrigin='anonymous' required for WebGL texture rendering.
-        // ESRI returns Access-Control-Allow-Origin: * so this works directly.
-        // Google proxied tiles also have CORS headers from our proxy.
-        crossOrigin: 'anonymous' as const,
+        // No crossOrigin needed — proxy is same-origin (localhost)
       },
       // OpenFreeMap vector tiles for buildings, roads, water
       'openmaptiles': {
@@ -212,16 +199,15 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
         maxzoom: VECTOR_SOURCES.openfreemap.maxzoom,
         attribution: VECTOR_SOURCES.openfreemap.attribution,
       },
-      // Label overlay — CARTO has CORS headers, loads directly
+      // Label overlay — proxied through /api/tile/proxy
       'labels': {
         type: 'raster' as const,
         tiles: [getLabelSource(c.nightMode).url],
         tileSize: 256,
         maxzoom: 19,
-        crossOrigin: 'anonymous' as const,
+        // No crossOrigin needed — proxy is same-origin (localhost)
       },
     },
-    // Sky layer for atmospheric rendering
     sky: c.showSky ? {
       'sky-color': c.nightMode ? '#0a0a1a' : '#88bbee',
       'horizon-color': c.nightMode ? '#1a1a2e' : '#b8d4e8',
@@ -233,7 +219,6 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
         ? ['interpolate', ['linear'], ['zoom'], 0, 0.3, 14, 0.1, 18, 0.05]
         : ['interpolate', ['linear'], ['zoom'], 0, 0.5, 14, 0.3, 18, 0.15],
     } : undefined,
-    // Light configuration for 3D building rendering
     light: {
       anchor: 'viewport',
       color: c.nightMode ? '#334466' : '#ffffff',
@@ -269,7 +254,7 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
         },
       }] : []),
 
-      // 3. Landuse — subtle fills for urban areas
+      // 3. Landuse
       {
         id: 'landuse',
         type: 'fill' as const,
@@ -445,19 +430,13 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
 // OSM BUILDINGS GEOJSON LOADER
 // ============================================
 
-/**
- * Fetch building GeoJSON from the OSM Overpass API route.
- *
- * The server-side route handles Overpass mirror failover.
- * Client timeout is generous since Overpass can be slow.
- */
 export async function fetchOSMBuildings(
   bounds: { south: number; west: number; north: number; east: number }
 ): Promise<GeoJSON.FeatureCollection | null> {
   try {
     const bbox = `${bounds.south},${bounds.west},${bounds.north},${bounds.east}`
     const response = await fetch(`/api/osm/buildings?bbox=${bbox}`, {
-      signal: AbortSignal.timeout(60000), // 60s — server handles Overpass failover
+      signal: AbortSignal.timeout(60000),
     })
 
     if (!response.ok) {
@@ -478,9 +457,6 @@ export async function fetchOSMBuildings(
   }
 }
 
-/**
- * Add OSM Overpass building data as a supplementary GeoJSON layer on the map.
- */
 export function addOSMBuildingLayer(
   map: maplibregl.Map,
   geojson: GeoJSON.FeatureCollection,
@@ -488,18 +464,15 @@ export function addOSMBuildingLayer(
 ): void {
   const c = { ...DEFAULT_MAP_CONFIG, ...config }
 
-  // Remove existing OSM buildings layer/source if present
   if (map.getLayer('osm-buildings-3d')) map.removeLayer('osm-buildings-3d')
   if (map.getLayer('osm-building-outline')) map.removeLayer('osm-building-outline')
   if (map.getSource('osm-buildings')) map.removeSource('osm-buildings')
 
-  // Add GeoJSON source
   map.addSource('osm-buildings', {
     type: 'geojson',
     data: geojson as any,
   })
 
-  // Add 3D extrusion layer
   map.addLayer({
     id: 'osm-buildings-3d',
     type: 'fill-extrusion',
@@ -540,7 +513,6 @@ export function addOSMBuildingLayer(
     },
   })
 
-  // Add outline for OSM buildings
   map.addLayer({
     id: 'osm-building-outline',
     type: 'line',

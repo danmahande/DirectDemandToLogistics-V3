@@ -747,13 +747,14 @@ export default function Navigation3DComponent({
           // ANIMATED ROUTE LINE
           // ============================================
           
-          map.addSource('route', {
-            type: 'geojson',
-            data: {
-              type: 'Feature',
-              properties: {},
-              geometry: { type: 'LineString', coordinates: roadCoords }
-            }
+         map.addSource('route', {
+          type: 'geojson',
+          lineMetrics: true,
+          data: {
+            type: 'Feature',
+            properties: {},
+            geometry: { type: 'LineString', coordinates: roadCoords }
+          }
           })
 
           // Route shadow

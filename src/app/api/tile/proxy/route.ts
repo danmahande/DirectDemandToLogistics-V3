@@ -1,18 +1,3 @@
-/**
- * Tile Proxy API (v8 — DNS failure handling + CORS headers)
- *
- * v8 FIXES:
- * - Added CORS headers (Access-Control-Allow-Origin: *) for WebGL rendering
- * - Added OPTIONS handler for CORS preflight requests
- * - Added DNS failure detection (ENOTFOUND) with clear error messages
- * - Increased effective timeout (uses API_LIMITS.TILE_PROXY_TIMEOUT which is now 30s)
- *
- * NOTE: ESRI World Imagery tiles have CORS headers and load directly
- * in the browser WITHOUT needing this proxy. This proxy is only needed
- * for Google satellite tiles (mt1.google.com) which block direct browser access.
- *
- * Usage: GET /api/tile/proxy?url=<encoded_tile_url>
- */
 
 import { NextRequest, NextResponse } from 'next/server'
 import { API_LIMITS, USER_AGENTS } from '@/lib/config'
@@ -25,7 +10,7 @@ interface CacheEntry {
 
 const tileCache = new Map<string, CacheEntry>()
 
-/** Common headers for all tile responses — includes CORS for WebGL */
+/** CORS headers for all responses — required for WebGL rendering */
 const TILE_RESPONSE_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET',
@@ -91,6 +76,7 @@ export async function GET(request: NextRequest) {
       )
     }
 
+    // Check cache
     const cacheKey = tileUrl
     const cached = tileCache.get(cacheKey)
 
@@ -105,10 +91,11 @@ export async function GET(request: NextRequest) {
       })
     }
 
+    // Fetch from external server
     const response = await fetch(tileUrl, {
       headers: {
         'User-Agent': USER_AGENTS.TILE_PROXY,
-        'Accept': 'image/png, image/jpeg, image/*',
+        'Accept': '*/*',  // v9: accept all content types (raster + vector tiles)
       },
       signal: AbortSignal.timeout(API_LIMITS.TILE_PROXY_TIMEOUT),
     })
@@ -123,6 +110,7 @@ export async function GET(request: NextRequest) {
     const arrayBuffer = await response.arrayBuffer()
     const contentType = response.headers.get('content-type') || 'image/png'
 
+    // Cache result
     tileCache.set(cacheKey, { data: arrayBuffer, timestamp: Date.now(), contentType })
     pruneCache()
 
@@ -136,20 +124,20 @@ export async function GET(request: NextRequest) {
     })
 
   } catch (error) {
-    // Detect DNS resolution failures — common in Kampala networks
-    const isDnsFailure = error instanceof TypeError && error.cause instanceof Error && error.cause.code === 'ENOTFOUND'
+    // Detect DNS resolution failures — return fast error
+    const cause = error instanceof TypeError && error.cause instanceof Error ? error.cause : null
+    const isDnsFailure = cause && (cause.code === 'ENOTFOUND' || cause.code === 'EAI_AGAIN')
     const isTimeout = error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError')
 
     if (isDnsFailure) {
-      console.error('[TileProxy] DNS resolution failed — the tile server hostname cannot be resolved from this network.')
+      console.error(`[TileProxy] DNS failed for: ${cause?.hostname || 'unknown'}`)
       return NextResponse.json(
-        { error: 'DNS resolution failed — tile server unreachable from this network', hint: 'Use ESRI World Imagery which loads directly without proxy' },
+        { error: `DNS resolution failed for ${cause?.hostname || 'tile server'}` },
         { status: 502, headers: TILE_RESPONSE_HEADERS }
       )
     }
 
     if (isTimeout) {
-      console.error('[TileProxy] Tile fetch timed out after', API_LIMITS.TILE_PROXY_TIMEOUT, 'ms')
       return NextResponse.json(
         { error: 'Tile fetch timed out' },
         { status: 504, headers: TILE_RESPONSE_HEADERS }

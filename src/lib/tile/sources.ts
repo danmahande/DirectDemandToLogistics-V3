@@ -1,10 +1,11 @@
 /**
- * Enhanced Tile Source Configuration (v7 — FIXED for Kampala)
+ * Enhanced Tile Source Configuration (v8 — FIXED satellite rendering + Overpass failover)
  *
- * KEY FIXES over v6:
- * - Google satellite routed through existing /api/tile/proxy to bypass browser CORS/access blocks
- * - OSM Buildings fetch timeout increased from 15s to 30s (Overpass API timeout is 25s)
- * - No fallbacks — if Google satellite fails, it fails explicitly (not silently)
+ * v8 FIXES over v7:
+ * - Added crossOrigin:'anonymous' to satellite raster source for WebGL rendering
+ *   (MapLibre needs CORS headers + crossOrigin to use raster tiles in WebGL textures)
+ * - Satellite source now uses crossOrigin for reliable rendering
+ * - Same architecture: Google satellite proxied, OpenFreeMap vector, CARTO labels
  *
  * Architecture (rendered bottom-to-top):
  *   1. Google Satellite (raster base — TRUE COLOR, proxied via /api/tile/proxy)
@@ -27,20 +28,12 @@ import type { StyleSpecification } from 'maplibre-gl'
 /**
  * Google satellite tile URL that goes through the existing tile proxy.
  *
- * WHY: Direct browser requests to mt1.google.com fail silently (CORS/403),
- * causing the map to render only vector layers (orange buildings + green
- * landuse) which looks like "infra-red" imagery instead of true-color
- * satellite photos. The proxy at /api/tile/proxy already has Google
- * domains in its allowlist and fetches tiles server-side.
+ * The proxy at /api/tile/proxy fetches tiles server-side, bypassing
+ * browser CORS/403 blocks on direct Google tile requests.
  *
- * HOW: We encode the base Google URL but keep {x},{y},{z} as unencoded
- * literals so MapLibre can find and substitute them with actual tile coords.
- * After substitution, the server decodes the url param and fetches from Google.
- *
- * Example flow:
- *   Template: /api/tile/proxy?url=https%3A%2F%2Fmt1.google.com%2Fvt%2Flyrs%3Ds%26x%3D{x}%26y%3D{y}%26z%3D{z}
- *   After MapLibre: /api/tile/proxy?url=https%3A%2F%2Fmt1.google.com%2Fvt%2Flyrs%3Ds%26x%3D5%26y%3D3%26z%3D3
- *   Server decodes: https://mt1.google.com/vt/lyrs=s&x=5&y=3&z=3
+ * v8: The tile proxy now returns CORS headers (Access-Control-Allow-Origin: *)
+ * AND we set crossOrigin:'anonymous' on the raster source so MapLibre
+ * explicitly uses CORS-aware image loading for WebGL texture rendering.
  */
 const GOOGLE_SATELLITE_BASE = encodeURIComponent('https://mt1.google.com/vt/lyrs=s')
 const GOOGLE_SATELLITE_PROXIED = `/api/tile/proxy?url=${GOOGLE_SATELLITE_BASE}%26x%3D{x}%26y%3D{y}%26z%3D{z}`
@@ -121,7 +114,7 @@ export const MAP_2D_SOURCES = {
 
 export interface MapStyleConfig {
   nightMode: boolean
-  buildingHeightExaggeration: number  // 1.0 = real, 2.0 = double height
+  buildingHeightExaggeration: number
   showBuildings: boolean
   showRoads: boolean
   showWater: boolean
@@ -138,18 +131,18 @@ export interface MapStyleConfig {
 
 export const DEFAULT_MAP_CONFIG: MapStyleConfig = {
   nightMode: false,
-  buildingHeightExaggeration: 2.0,     // FIXED: was 1.0, now 2.0 for Kampala where height data is sparse
+  buildingHeightExaggeration: 2.0,
   showBuildings: true,
   showRoads: true,
   showWater: true,
   showLabels: true,
   showSatellite: true,
   showSky: true,
-  buildingOpacity: 0.88,               // FIXED: was 0.75, now 0.88 for better visibility
+  buildingOpacity: 0.88,
   satelliteOpacity: 1.0,
   roadOpacity: 0.85,
   labelOpacity: 0.7,
-  satelliteSource: 'google',            // FIXED: Google satellite via proxy = true-color
+  satelliteSource: 'google',
 }
 
 // ============================================
@@ -176,11 +169,12 @@ export function getLabelSource(nightMode: boolean) {
 /**
  * Build the complete MapLibre style object for the 3D map.
  *
- * FIXED: Google satellite proxied via /api/tile/proxy for reliable loading.
- * FIXED: Building colors vibrant high-contrast against satellite imagery.
- * FIXED: Building height exaggeration default 2.0 for sparse height data.
- * FIXED: Building minzoom lowered from 13 to 11.
- * FIXED: Building fallback height from 5m to 12m.
+ * v8: Added crossOrigin:'anonymous' to satellite raster source for WebGL.
+ * This is required because MapLibre uses WebGL to render the map, and
+ * raster tile images must be loadable as WebGL textures. Without
+ * crossOrigin:'anonymous' + CORS headers on the proxy, the browser
+ * blocks the image data from being used in WebGL, causing satellite
+ * tiles to silently fail to render (showing only vector layers).
  */
 export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpecification {
   const c = { ...DEFAULT_MAP_CONFIG, ...config }
@@ -190,13 +184,17 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
   return {
     version: 8 as const,
     sources: {
-      // Base satellite imagery — FIXED: Google proxied for reliable true-color
+      // Base satellite imagery — FIXED: Google proxied + crossOrigin for WebGL
       'satellite': {
         type: 'raster' as const,
         tiles: [satSource.url],
         tileSize: 256,
         maxzoom: satSource.maxzoom,
         attribution: satSource.attribution,
+        // v8 FIX: crossOrigin='anonymous' tells MapLibre to set crossOrigin on
+        // <img> elements so WebGL can use the pixel data. REQUIRES the server
+        // (our /api/tile/proxy) to return Access-Control-Allow-Origin headers.
+        crossOrigin: 'anonymous' as const,
       },
       // OpenFreeMap vector tiles for buildings, roads, water
       'openmaptiles': {
@@ -211,6 +209,7 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
         tiles: [getLabelSource(c.nightMode).url],
         tileSize: 256,
         maxzoom: 19,
+        crossOrigin: 'anonymous' as const,
       },
     },
     // Sky layer for atmospheric rendering
@@ -231,8 +230,8 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
       color: c.nightMode ? '#334466' : '#ffffff',
       intensity: c.nightMode ? 0.4 : 0.6,
       position: c.nightMode
-        ? [1.15, 210, 30]  // Moonlight from southwest
-        : [1.15, 90, 30],   // Sunlight from east (morning in Kampala)
+        ? [1.15, 210, 30]
+        : [1.15, 90, 30],
     },
     layers: [
       // 1. Satellite base
@@ -275,42 +274,39 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
         },
       },
 
-      // 4. 3D Buildings — FIXED: vibrant colors, lower minzoom, higher default height
+      // 4. 3D Buildings
       ...(c.showBuildings ? [
         {
           id: '3d-buildings',
           type: 'fill-extrusion' as const,
           source: 'openmaptiles',
           'source-layer': 'building',
-          minzoom: 11,                      // FIXED: was 13, now 11 for earlier visibility
+          minzoom: 11,
           paint: {
-            // FIXED: Changed from muted gray to VIBRANT, high-contrast colors
-            // that stand out clearly against satellite imagery
             'fill-extrusion-color': c.nightMode
               ? [
                   'interpolate', ['linear'], ['get', 'render_height'],
-                  0, '#4a6fa5',      // Deep blue — ground/short
-                  10, '#5b82b8',     // Medium blue
-                  20, '#6c95cb',     // Blue
-                  40, '#7da8de',     // Light blue
-                  60, '#8ebbef',     // Bright blue
-                  80, '#9fcfff',     // Sky blue
-                  100, '#b0e0ff',    // Ice blue — tall/skyscraper
+                  0, '#4a6fa5',
+                  10, '#5b82b8',
+                  20, '#6c95cb',
+                  40, '#7da8de',
+                  60, '#8ebbef',
+                  80, '#9fcfff',
+                  100, '#b0e0ff',
                 ]
               : [
                   'interpolate', ['linear'], ['get', 'render_height'],
-                  0, '#e8a838',      // Warm orange — ground/short (HIGHEST CONTRAST vs green satellite)
-                  10, '#e0922e',     // Deep orange
-                  20, '#d87c24',     // Burnt orange
-                  40, '#c46820',     // Rust
-                  60, '#b0541c',     // Brown-orange
-                  80, '#9c4018',     // Deep brown
-                  100, '#882c14',    // Dark mahogany — tall/skyscraper
+                  0, '#e8a838',
+                  10, '#e0922e',
+                  20, '#d87c24',
+                  40, '#c46820',
+                  60, '#b0541c',
+                  80, '#9c4018',
+                  100, '#882c14',
                 ],
-            // FIXED: Height fallback from 5m to 12m for Kampala sparse data
             'fill-extrusion-height': [
               '*',
-              ['coalesce', ['get', 'render_height'], 12],   // FIXED: was 5, now 12
+              ['coalesce', ['get', 'render_height'], 12],
               heightMultiplier,
             ],
             'fill-extrusion-base': [
@@ -321,13 +317,12 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
             'fill-extrusion-opacity': c.buildingOpacity,
           },
         },
-        // Building outline layer for better definition
         {
           id: 'building-outline',
           type: 'line' as const,
           source: 'openmaptiles',
           'source-layer': 'building',
-          minzoom: 14,                      // Lowered from 15 to 14
+          minzoom: 14,
           paint: {
             'line-color': c.nightMode ? '#5a5a7a' : '#ffffff',
             'line-width': [
@@ -343,7 +338,6 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
 
       // 5. Road network
       ...(c.showRoads ? [
-        // Major roads (primary, trunk)
         {
           id: 'road-major-casing',
           type: 'line' as const,
@@ -384,7 +378,6 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
             'line-opacity': c.roadOpacity,
           },
         },
-        // Secondary & tertiary roads
         {
           id: 'road-secondary',
           type: 'line' as const,
@@ -404,7 +397,6 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
             'line-opacity': c.roadOpacity * 0.9,
           },
         },
-        // Minor roads
         {
           id: 'road-minor',
           type: 'line' as const,
@@ -446,13 +438,9 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
 
 /**
  * Fetch building GeoJSON from the OSM Overpass API route.
- * This supplements the OpenFreeMap vector tile buildings with
- * potentially more complete data for Kampala.
  *
- * FIXED: Timeout increased from 15s to 30s to match the Overpass API
- * server-side timeout of 25s. The previous 15s timeout was causing
- * TimeoutError (code 23) because Overpass responses for Kampala
- * typically take 12-18 seconds.
+ * The server-side route (/api/osm/buildings) now uses multiple Overpass
+ * API mirrors with automatic failover, so client-side timeout is generous.
  */
 export async function fetchOSMBuildings(
   bounds: { south: number; west: number; north: number; east: number }
@@ -460,7 +448,7 @@ export async function fetchOSMBuildings(
   try {
     const bbox = `${bounds.south},${bounds.west},${bounds.north},${bounds.east}`
     const response = await fetch(`/api/osm/buildings?bbox=${bbox}`, {
-      signal: AbortSignal.timeout(30000),  // FIXED: was 15000, now 30000 to match Overpass API 25s timeout
+      signal: AbortSignal.timeout(60000),  // 60s — server handles Overpass failover
     })
 
     if (!response.ok) {
@@ -473,7 +461,7 @@ export async function fetchOSMBuildings(
     return data
   } catch (error) {
     if (error instanceof DOMException && error.name === 'TimeoutError') {
-      console.error('[OSM Buildings] Request timed out after 30s. The Overpass API may be overloaded.')
+      console.error('[OSM Buildings] Request timed out after 60s. The Overpass API may be overloaded.')
     } else {
       console.error('[OSM Buildings] Fetch error:', error)
     }
@@ -483,7 +471,6 @@ export async function fetchOSMBuildings(
 
 /**
  * Add OSM Overpass building data as a supplementary GeoJSON layer on the map.
- * This ensures buildings are visible even if OpenFreeMap tiles are sparse.
  */
 export function addOSMBuildingLayer(
   map: maplibregl.Map,
@@ -503,7 +490,7 @@ export function addOSMBuildingLayer(
     data: geojson as any,
   })
 
-  // Add 3D extrusion layer — same vibrant colors as vector tile buildings
+  // Add 3D extrusion layer
   map.addLayer({
     id: 'osm-buildings-3d',
     type: 'fill-extrusion',
@@ -567,10 +554,8 @@ export function addOSMBuildingLayer(
 // KAMPALA-SPECIFIC MAP DEFAULTS
 // ============================================
 
-/** Default center on Nakasero Market, Kampala */
-export const KAMPALA_CENTER: [number, number] = [32.5814, 0.3152] // [lng, lat]
+export const KAMPALA_CENTER: [number, number] = [32.5814, 0.3152]
 
-/** Default map camera settings for 3D view */
 export const DEFAULT_3D_CAMERA = {
   center: KAMPALA_CENTER,
   zoom: 14.5,
@@ -581,7 +566,6 @@ export const DEFAULT_3D_CAMERA = {
   maxZoom: 18,
 } as const
 
-/** Default map camera settings for navigation view */
 export const NAVIGATION_CAMERA = {
   center: KAMPALA_CENTER,
   zoom: 16,
@@ -592,8 +576,7 @@ export const NAVIGATION_CAMERA = {
   maxZoom: 18,
 } as const
 
-/** Kampala bounding box for restricting map view */
 export const KAMPALA_BOUNDS: [[number, number], [number, number]] = [
-  [32.44, 0.22],  // SW corner [lng, lat]
-  [32.72, 0.42],  // NE corner [lng, lat]
+  [32.44, 0.22],
+  [32.72, 0.42],
 ]

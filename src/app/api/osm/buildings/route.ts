@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 
 // ═══════════════════════════════════════════════════════════
-// OSM BUILDINGS API (v6 — FIXED)
+// OSM BUILDINGS API (v7 — OVERPASS FAILOVER)
 // ═══════════════════════════════════════════════════════════
 // Fetches building data from OpenStreetMap Overpass API
 // for a given bounding box around Kampala.
@@ -9,9 +9,22 @@ import { NextRequest, NextResponse } from 'next/server'
 // Usage: GET /api/osm/buildings?bbox=south,west,north,east
 //
 // Returns: GeoJSON FeatureCollection of buildings with height data
+//
+// v7 FIXES:
+// - Multiple Overpass API mirrors with automatic failover
+// - Retry with backoff on 429 (rate limit) responses
+// - Rounded bbox for better cache hit rate
+// - Longer timeout (30s) to match Overpass query timeout
 // ═══════════════════════════════════════════════════════════
 
-const OVERPASS_API = 'https://overpass-api.de/api/interpreter'
+// Multiple Overpass API endpoints — try each in order on failure
+const OVERPASS_MIRRORS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://lz4.overpass-api.de/api/interpreter',
+  'https://z.overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+]
+
 const CACHE_DURATION = 6 * 60 * 60 * 1000 // 6 hours (buildings don't change often)
 
 interface BuildingCacheEntry {
@@ -22,12 +35,22 @@ interface BuildingCacheEntry {
 const buildingCache = new Map<string, BuildingCacheEntry>()
 
 /**
+ * Round bbox coordinates to 3 decimal places (~111m precision)
+ * to increase cache hit rate for slightly different viewport positions.
+ */
+function roundBbox(bbox: string): string {
+  return bbox
+    .split(',')
+    .map(v => parseFloat(v).toFixed(3))
+    .join(',')
+}
+
+/**
  * Build Overpass QL query for buildings in a bounding box
  */
 function buildOverpassQuery(bbox: string): string {
-  // bbox format: south,west,north,east (lat,lng)
   return `
-[out:json][timeout:25];
+[out:json][timeout:30];
 (
   way["building"](${bbox});
   relation["building"](${bbox});
@@ -36,6 +59,56 @@ out body;
 >;
 out skel qt;
 `
+}
+
+/**
+ * Try fetching from Overpass API with mirror failover and 429 retry.
+ */
+async function fetchFromOverpass(query: string): Promise<Response> {
+  const maxRetries = 2 // retry each mirror up to 2 times on 429
+  const retryDelay = 3000 // wait 3s before retrying on 429
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    for (const mirrorUrl of OVERPASS_MIRRORS) {
+      try {
+        const response = await fetch(mirrorUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'User-Agent': 'DirectDDL/7.0 (Kampala Logistics)',
+          },
+          body: `data=${encodeURIComponent(query)}`,
+          signal: AbortSignal.timeout(30000), // 30s timeout — Overpass query timeout is 30s
+        })
+
+        // Success — return the response
+        if (response.ok) {
+          return response
+        }
+
+        // 429 rate limit — wait and retry this mirror once, then try next
+        if (response.status === 429) {
+          console.warn(`[OSM Buildings] Rate limited (429) on ${mirrorUrl}, attempt ${attempt + 1}/${maxRetries}`)
+          if (attempt < maxRetries - 1) {
+            await new Promise(resolve => setTimeout(resolve, retryDelay))
+            continue
+          }
+          continue // try next mirror
+        }
+
+        // Other server error — try next mirror
+        console.warn(`[OSM Buildings] Server error ${response.status} on ${mirrorUrl}, trying next mirror`)
+        continue
+      } catch (error) {
+        // Timeout or network error — try next mirror
+        console.warn(`[OSM Buildings] Error on ${mirrorUrl}:`, error instanceof Error ? error.message : error)
+        continue
+      }
+    }
+  }
+
+  // All mirrors failed
+  throw new Error('All Overpass API mirrors failed')
 }
 
 /**
@@ -121,28 +194,22 @@ function overpassToGeoJSON(data: {
 
 /**
  * Parse height from OSM tags
- * Accepts formats: "15", "15 m", "15m", "5 stories"
  */
 function parseHeight(heightStr?: string, levelsStr?: string | null): number {
   if (heightStr) {
-    // Try direct number
     const direct = parseFloat(heightStr)
     if (!isNaN(direct)) return direct
 
-    // Try "15 m" or "15m" format
     const withUnit = heightStr.match(/^([\d.]+)\s*m/)
     if (withUnit) return parseFloat(withUnit[1])
   }
 
-  // Estimate from levels (3m per level)
   if (levelsStr) {
     const levels = parseInt(levelsStr)
     if (!isNaN(levels)) return levels * 3
   }
 
-  // FIXED: Default height for unmapped buildings changed from 5m to 12m
-  // to match the coalesce default in sources.ts build3DMapStyle()
-  return 12
+  return 12 // Default height for unmapped buildings
 }
 
 /**
@@ -162,9 +229,9 @@ function classifyBuilding(tags: Record<string, string>): string {
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url)
-    const bbox = searchParams.get('bbox')
+    const rawBbox = searchParams.get('bbox')
 
-    if (!bbox) {
+    if (!rawBbox) {
       return NextResponse.json(
         { error: 'Missing required parameter: bbox (format: south,west,north,east)' },
         { status: 400 }
@@ -172,7 +239,7 @@ export async function GET(request: NextRequest) {
     }
 
     // Validate bbox format
-    const parts = bbox.split(',').map(Number)
+    const parts = rawBbox.split(',').map(Number)
     if (parts.length !== 4 || parts.some(isNaN)) {
       return NextResponse.json(
         { error: 'Invalid bbox format. Expected: south,west,north,east' },
@@ -180,9 +247,11 @@ export async function GET(request: NextRequest) {
       )
     }
 
+    // Round bbox for better cache hits
+    const bbox = roundBbox(rawBbox)
+
     // Check cache
-    const cacheKey = bbox
-    const cached = buildingCache.get(cacheKey)
+    const cached = buildingCache.get(bbox)
     if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
       return NextResponse.json(cached.data, {
         headers: {
@@ -192,31 +261,15 @@ export async function GET(request: NextRequest) {
       })
     }
 
-    // Query Overpass API
+    // Query Overpass API with mirror failover
     const query = buildOverpassQuery(bbox)
-    const response = await fetch(OVERPASS_API, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': 'DirectDDL/6.0',
-      },
-      body: `data=${encodeURIComponent(query)}`,
-      signal: AbortSignal.timeout(25000),
-    })
-
-    if (!response.ok) {
-      console.error('[OSM Buildings] Overpass API error:', response.status)
-      return NextResponse.json(
-        { error: 'Overpass API request failed', status: response.status },
-        { status: response.status }
-      )
-    }
+    const response = await fetchFromOverpass(query)
 
     const overpassData = await response.json()
     const geojson = overpassToGeoJSON(overpassData)
 
     // Cache result
-    buildingCache.set(cacheKey, { data: geojson, timestamp: Date.now() })
+    buildingCache.set(bbox, { data: geojson, timestamp: Date.now() })
 
     return NextResponse.json(geojson, {
       headers: {
@@ -229,16 +282,16 @@ export async function GET(request: NextRequest) {
   } catch (error) {
     console.error('[OSM Buildings] Error:', error)
 
-    if (error instanceof Error && error.name === 'AbortError') {
+    if (error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError')) {
       return NextResponse.json(
-        { error: 'Overpass API request timed out' },
+        { error: 'Overpass API request timed out. All mirrors were tried.' },
         { status: 504 }
       )
     }
 
     return NextResponse.json(
-      { error: 'Building data fetch failed' },
-      { status: 500 }
+      { error: 'Building data fetch failed. All Overpass API mirrors were tried.' },
+      { status: 504 }
     )
   }
 }

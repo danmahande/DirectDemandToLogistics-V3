@@ -1,14 +1,18 @@
 /**
- * Enhanced Tile Source Configuration (v8 — FIXED satellite rendering + Overpass failover)
+ * Enhanced Tile Source Configuration (v9 — ESRI World Imagery as default)
  *
- * v8 FIXES over v7:
- * - Added crossOrigin:'anonymous' to satellite raster source for WebGL rendering
- *   (MapLibre needs CORS headers + crossOrigin to use raster tiles in WebGL textures)
- * - Satellite source now uses crossOrigin for reliable rendering
- * - Same architecture: Google satellite proxied, OpenFreeMap vector, CARTO labels
+ * v9 FIXES over v8:
+ * - Switched default satellite source to ESRI World Imagery (TRUE-COLOR, direct load)
+ * - ESRI tiles have Access-Control-Allow-Origin: * headers, so they load
+ *   DIRECTLY in the browser without needing a proxy server
+ * - Google satellite REQUIRES proxy + DNS resolution of mt1.google.com,
+ *   which is UNRELIABLE from Kampala networks (ENOTFOUND errors)
+ * - ESRI World Imagery = true-color satellite imagery for Kampala
+ *   (NOT to be confused with ESRI Clarity which shows infrared)
+ * - crossOrigin:'anonymous' set on all raster sources for WebGL
  *
  * Architecture (rendered bottom-to-top):
- *   1. Google Satellite (raster base — TRUE COLOR, proxied via /api/tile/proxy)
+ *   1. ESRI World Imagery (raster base — TRUE COLOR, direct load, CORS)
  *   2. OpenFreeMap Water (vector fill)
  *   3. OpenFreeMap Landuse (vector, subtle fill)
  *   4. Sky layer (atmospheric gradient)
@@ -16,7 +20,7 @@
  *   6. 3D Buildings — OSM Overpass GeoJSON supplement (fill-extrusion)
  *   7. OpenFreeMap Roads (vector lines)
  *   8. Delivery route (geojson line)
- *   9. CARTO Labels (raster overlay)
+ *   9. CARTO Labels (raster overlay, direct load, CORS)
  */
 
 import type { StyleSpecification } from 'maplibre-gl'
@@ -26,39 +30,49 @@ import type { StyleSpecification } from 'maplibre-gl'
 // ============================================
 
 /**
- * Google satellite tile URL that goes through the existing tile proxy.
+ * ESRI World Imagery — TRUE COLOR satellite tiles.
  *
- * The proxy at /api/tile/proxy fetches tiles server-side, bypassing
- * browser CORS/403 blocks on direct Google tile requests.
+ * WHY ESRI, not Google:
+ * - ESRI ArcGIS Online returns Access-Control-Allow-Origin: * headers
+ *   so tiles load DIRECTLY in the browser (no proxy needed, no timeouts)
+ * - Google satellite (mt1.google.com) requires a server-side proxy,
+ *   but DNS resolution of mt1.google.com is UNRELIABLE from Kampala
+ *   networks, causing ENOTFOUND errors and tile proxy timeouts
+ * - ESRI World Imagery is TRUE COLOR in Kampala (RGB satellite photos)
+ * - NOT the same as ESRI Clarity which shows infrared/false-color
  *
- * v8: The tile proxy now returns CORS headers (Access-Control-Allow-Origin: *)
- * AND we set crossOrigin:'anonymous' on the raster source so MapLibre
- * explicitly uses CORS-aware image loading for WebGL texture rendering.
+ * Tile URL: https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}
+ * CORS: Access-Control-Allow-Origin: * (verified)
+ * Max zoom: 19
+ */
+const ESRI_WORLD_IMAGERY = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
+
+/**
+ * Google satellite tile URL template (requires proxy).
+ *
+ * WARNING: mt1.google.com DNS resolution is UNRELIABLE from Kampala.
+ * Only use if your network can resolve Google hostnames.
+ * Requires /api/tile/proxy for CORS bypass.
  */
 const GOOGLE_SATELLITE_BASE = encodeURIComponent('https://mt1.google.com/vt/lyrs=s')
 const GOOGLE_SATELLITE_PROXIED = `/api/tile/proxy?url=${GOOGLE_SATELLITE_BASE}%26x%3D{x}%26y%3D{y}%26z%3D{z}`
 
 export const SATELLITE_SOURCES = {
-  /** Google Maps Satellite — TRUE COLOR, proxied via /api/tile/proxy */
+  /** ESRI World Imagery — TRUE COLOR satellite, direct load with CORS (RECOMMENDED for Kampala) */
+  esri: {
+    id: 'esri-world',
+    url: ESRI_WORLD_IMAGERY,
+    maxzoom: 19,
+    attribution: 'Esri, Maxar, Earthstar Geographics',
+    requiresProxy: false, // ESRI has CORS headers — loads directly
+  },
+  /** Google Maps Satellite — TRUE COLOR but requires proxy + DNS resolution of mt1.google.com */
   google: {
     id: 'google-satellite',
     url: GOOGLE_SATELLITE_PROXIED,
     maxzoom: 20,
     attribution: 'Google Maps',
-  },
-  /** ESRI World Imagery — may show infrared for some African regions */
-  esri: {
-    id: 'esri-world',
-    url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-    maxzoom: 19,
-    attribution: 'Esri, Maxar, Earthstar Geographics',
-  },
-  /** ESRI Clarity — KNOWN to show infrared in Kampala */
-  esriClarity: {
-    id: 'esri-clarity',
-    url: 'https://clarity.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-    maxzoom: 19,
-    attribution: 'Esri',
+    requiresProxy: true, // Google blocks direct browser access — needs proxy
   },
 } as const
 
@@ -67,7 +81,7 @@ export const VECTOR_SOURCES = {
   openfreemap: {
     id: 'openfreemap',
     url: 'https://tiles.openfreemap.org/planet/{z}/{x}/{y}.pbf',
-    maxzoom: 14, // OpenFreeMap max detail zoom; MapLibre overzooms beyond this
+    maxzoom: 14,
     attribution: 'OpenFreeMap, OpenMapTiles, OpenStreetMap',
   },
 } as const
@@ -125,8 +139,8 @@ export interface MapStyleConfig {
   satelliteOpacity: number
   roadOpacity: number
   labelOpacity: number
-  /** Which satellite source to use: 'google' (true-color, proxied), 'esri', or 'esriClarity' */
-  satelliteSource: 'google' | 'esri' | 'esriClarity'
+  /** Which satellite source: 'esri' (recommended, direct CORS) or 'google' (needs proxy) */
+  satelliteSource: 'esri' | 'google'
 }
 
 export const DEFAULT_MAP_CONFIG: MapStyleConfig = {
@@ -142,7 +156,7 @@ export const DEFAULT_MAP_CONFIG: MapStyleConfig = {
   satelliteOpacity: 1.0,
   roadOpacity: 0.85,
   labelOpacity: 0.7,
-  satelliteSource: 'google',
+  satelliteSource: 'esri',  // v9: ESRI World Imagery — reliable from Kampala, direct CORS
 }
 
 // ============================================
@@ -152,9 +166,8 @@ export const DEFAULT_MAP_CONFIG: MapStyleConfig = {
 function getSatelliteSource(source: MapStyleConfig['satelliteSource']) {
   switch (source) {
     case 'google': return SATELLITE_SOURCES.google
-    case 'esri': return SATELLITE_SOURCES.esri
-    case 'esriClarity': return SATELLITE_SOURCES.esriClarity
-    default: return SATELLITE_SOURCES.google
+    case 'esri':
+    default: return SATELLITE_SOURCES.esri
   }
 }
 
@@ -169,12 +182,8 @@ export function getLabelSource(nightMode: boolean) {
 /**
  * Build the complete MapLibre style object for the 3D map.
  *
- * v8: Added crossOrigin:'anonymous' to satellite raster source for WebGL.
- * This is required because MapLibre uses WebGL to render the map, and
- * raster tile images must be loadable as WebGL textures. Without
- * crossOrigin:'anonymous' + CORS headers on the proxy, the browser
- * blocks the image data from being used in WebGL, causing satellite
- * tiles to silently fail to render (showing only vector layers).
+ * v9: ESRI World Imagery as default — loads directly with CORS, no proxy.
+ * crossOrigin:'anonymous' set on all raster sources for WebGL compatibility.
  */
 export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpecification {
   const c = { ...DEFAULT_MAP_CONFIG, ...config }
@@ -184,16 +193,16 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
   return {
     version: 8 as const,
     sources: {
-      // Base satellite imagery — FIXED: Google proxied + crossOrigin for WebGL
+      // Base satellite imagery — ESRI World Imagery (direct, CORS) or Google (proxied)
       'satellite': {
         type: 'raster' as const,
         tiles: [satSource.url],
         tileSize: 256,
         maxzoom: satSource.maxzoom,
         attribution: satSource.attribution,
-        // v8 FIX: crossOrigin='anonymous' tells MapLibre to set crossOrigin on
-        // <img> elements so WebGL can use the pixel data. REQUIRES the server
-        // (our /api/tile/proxy) to return Access-Control-Allow-Origin headers.
+        // crossOrigin='anonymous' required for WebGL texture rendering.
+        // ESRI returns Access-Control-Allow-Origin: * so this works directly.
+        // Google proxied tiles also have CORS headers from our proxy.
         crossOrigin: 'anonymous' as const,
       },
       // OpenFreeMap vector tiles for buildings, roads, water
@@ -203,7 +212,7 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
         maxzoom: VECTOR_SOURCES.openfreemap.maxzoom,
         attribution: VECTOR_SOURCES.openfreemap.attribution,
       },
-      // Label overlay
+      // Label overlay — CARTO has CORS headers, loads directly
       'labels': {
         type: 'raster' as const,
         tiles: [getLabelSource(c.nightMode).url],
@@ -439,8 +448,8 @@ export function build3DMapStyle(config: Partial<MapStyleConfig> = {}): StyleSpec
 /**
  * Fetch building GeoJSON from the OSM Overpass API route.
  *
- * The server-side route (/api/osm/buildings) now uses multiple Overpass
- * API mirrors with automatic failover, so client-side timeout is generous.
+ * The server-side route handles Overpass mirror failover.
+ * Client timeout is generous since Overpass can be slow.
  */
 export async function fetchOSMBuildings(
   bounds: { south: number; west: number; north: number; east: number }
@@ -448,7 +457,7 @@ export async function fetchOSMBuildings(
   try {
     const bbox = `${bounds.south},${bounds.west},${bounds.north},${bounds.east}`
     const response = await fetch(`/api/osm/buildings?bbox=${bbox}`, {
-      signal: AbortSignal.timeout(60000),  // 60s — server handles Overpass failover
+      signal: AbortSignal.timeout(60000), // 60s — server handles Overpass failover
     })
 
     if (!response.ok) {
@@ -461,7 +470,7 @@ export async function fetchOSMBuildings(
     return data
   } catch (error) {
     if (error instanceof DOMException && error.name === 'TimeoutError') {
-      console.error('[OSM Buildings] Request timed out after 60s. The Overpass API may be overloaded.')
+      console.error('[OSM Buildings] Request timed out after 60s.')
     } else {
       console.error('[OSM Buildings] Fetch error:', error)
     }

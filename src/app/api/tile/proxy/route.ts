@@ -1,15 +1,15 @@
 /**
- * Tile Proxy API (v7 — FIXED: Added CORS headers for WebGL rendering)
+ * Tile Proxy API (v8 — DNS failure handling + CORS headers)
  *
- * CRITICAL FIX: MapLibre GL JS uses WebGL to render the map. When raster tile
- * images are loaded into WebGL textures, the browser requires CORS headers
- * (Access-Control-Allow-Origin) on the response. Without these headers, the
- * browser blocks the image data from being used in WebGL, causing satellite
- * tiles to silently fail even though the HTTP request returns 200.
+ * v8 FIXES:
+ * - Added CORS headers (Access-Control-Allow-Origin: *) for WebGL rendering
+ * - Added OPTIONS handler for CORS preflight requests
+ * - Added DNS failure detection (ENOTFOUND) with clear error messages
+ * - Increased effective timeout (uses API_LIMITS.TILE_PROXY_TIMEOUT which is now 30s)
  *
- * This was the root cause of the "infra-red" map appearance: satellite tiles
- * were loading (200 responses) but couldn't render on the WebGL canvas, so
- * only vector layers (orange buildings, green landuse, blue water) showed.
+ * NOTE: ESRI World Imagery tiles have CORS headers and load directly
+ * in the browser WITHOUT needing this proxy. This proxy is only needed
+ * for Google satellite tiles (mt1.google.com) which block direct browser access.
  *
  * Usage: GET /api/tile/proxy?url=<encoded_tile_url>
  */
@@ -136,13 +136,27 @@ export async function GET(request: NextRequest) {
     })
 
   } catch (error) {
-    console.error('[TileProxy] Error:', error)
-    if (error instanceof Error && error.name === 'AbortError') {
+    // Detect DNS resolution failures — common in Kampala networks
+    const isDnsFailure = error instanceof TypeError && error.cause instanceof Error && error.cause.code === 'ENOTFOUND'
+    const isTimeout = error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError')
+
+    if (isDnsFailure) {
+      console.error('[TileProxy] DNS resolution failed — the tile server hostname cannot be resolved from this network.')
+      return NextResponse.json(
+        { error: 'DNS resolution failed — tile server unreachable from this network', hint: 'Use ESRI World Imagery which loads directly without proxy' },
+        { status: 502, headers: TILE_RESPONSE_HEADERS }
+      )
+    }
+
+    if (isTimeout) {
+      console.error('[TileProxy] Tile fetch timed out after', API_LIMITS.TILE_PROXY_TIMEOUT, 'ms')
       return NextResponse.json(
         { error: 'Tile fetch timed out' },
         { status: 504, headers: TILE_RESPONSE_HEADERS }
       )
     }
+
+    console.error('[TileProxy] Error:', error)
     return NextResponse.json(
       { error: 'Tile proxy failed' },
       { status: 500, headers: TILE_RESPONSE_HEADERS }

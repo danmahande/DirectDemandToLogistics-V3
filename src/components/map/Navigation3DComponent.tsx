@@ -638,8 +638,8 @@ export default function Navigation3DComponent({
           satelliteOpacity: 1.0,
           roadOpacity: 0.85,
           labelOpacity: nightMode ? 0.8 : 0.7,
-          satelliteSource: 'google' as const,      // FIXED: NEW — Google satellite = true-color for Kampala
-        })
+          satelliteSource: 'esri' as const,        // v9: ESRI World Imagery — true-color, direct CORS, no proxy needed        
+          })
 
         // ============================================
         // CREATE MAP WITH 3D BUILDINGS + TRUE-COLOR SATELLITE

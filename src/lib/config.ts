@@ -1,9 +1,11 @@
 /**
- * Centralized Configuration Constants (v3 — FIXED)
+ * Centralized Configuration Constants (v4 — FIXED for Kampala network)
  *
- * KEY FIXES over v2:
- * - Added Google Maps satellite URL (true-color for Kampala)
- * - Updated ESRI satellite URL comment (may show infrared in Africa)
+ * v4 FIXES over v3:
+ * - Increased TILE_PROXY_TIMEOUT from 10s to 30s (Google tiles need more time from Kampala)
+ * - Updated ESRI satellite URL comment: ESRI World Imagery = TRUE-COLOR (not infrared)
+ *   Infrared issue was with ESRI Clarity, not ESRI World Imagery
+ * - ESRI World Imagery has CORS headers, loads directly without proxy
  *
  * All API URLs, rate limits, and constants for the logistics dashboard.
  * Only free, no-API-key-required services are used.
@@ -30,8 +32,8 @@ export const API_LIMITS = {
   TILE_CACHE_PRUNE_RATIO: 0.25,
   /** Tile proxy cache duration (ms) — 24 hours */
   TILE_CACHE_DURATION: 24 * 60 * 60 * 1000,
-  /** Tile proxy request timeout (ms) */
-  TILE_PROXY_TIMEOUT: 10000,
+  /** Tile proxy request timeout (ms) — v4: increased from 10s to 30s for Kampala network */
+  TILE_PROXY_TIMEOUT: 30000,
 } as const
 
 // ============================================
@@ -57,14 +59,14 @@ export const USER_AGENTS = {
 } as const
 
 // ============================================
-// TILE URLS (FIXED: added Google satellite)
+// TILE URLS (v4: ESRI World Imagery = TRUE-COLOR for Kampala)
 // ============================================
 
 export const TILE_URLS = {
-  /** Google Maps Satellite — TRUE COLOR, high-res globally (RECOMMENDED for Kampala) */
-  GOOGLE_SATELLITE: 'https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
-  /** ESRI World Imagery satellite tiles — may show infrared/false-color in parts of Africa */
+  /** ESRI World Imagery — TRUE COLOR satellite, has CORS headers, loads directly (RECOMMENDED for Kampala) */
   ESRI_SATELLITE: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+  /** Google Maps Satellite — TRUE COLOR but DNS resolution (mt1.google.com) unreliable from Kampala */
+  GOOGLE_SATELLITE: 'https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
   /** OpenFreeMap vector tiles with building heights */
   OPENFREEMAP_VECTOR: 'https://tiles.openfreemap.org/planet/{z}/{x}/{y}.pbf',
   /** CARTO light labels overlay */
